@@ -26,7 +26,7 @@ The safe sequence is:
 1. Stop graph production and prevent new ring writes.
 2. Stop submitting new transfers.
 3. Reap/cancel outstanding transfers and drain completion callbacks.
-4. Wake the event thread explicitly; join event and realtime workers.
+4. Signal capture/playback waiters, then join the libusb event and realtime workers; the libusb event loop has a bounded timeout and cancellation callbacks complete teardown.
 5. Release claimed interfaces and native driver resources.
 6. Close the native driver.
 7. Close `UsbDeviceConnection` last.

@@ -13,6 +13,7 @@
 #define GUITARRACKCRAFT_DIRECT_USB_OUTPUT_H
 
 #include "liblowlatencyaudio/libusb_uac_driver.h"
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>

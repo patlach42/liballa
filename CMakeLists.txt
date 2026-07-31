@@ -7,6 +7,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(LOWLATENCY_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
 if(ANDROID)
     set(LIBUSB_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libusb")
+    if(NOT EXISTS "${LIBUSB_ROOT}/libusb/core.c")
+        message(FATAL_ERROR
+            "Bundled libusb is missing; run: git submodule update --init --recursive")
+    endif()
     add_library(lowlatencyaudio_libusb STATIC
         ${LIBUSB_ROOT}/libusb/core.c
         ${LIBUSB_ROOT}/libusb/descriptor.c

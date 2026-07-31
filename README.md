@@ -2,6 +2,17 @@
 
 Autonomous C++17 Android direct-USB UAC low-latency driver pack. The public CMake target is `lowlatencyaudio::lowlatencyaudio`; it contains `LibusbUacDriver`, `UsbScheduling`, and the float `DirectUsbOutput` adapter. AudioEngine, RackGraph, plugins, JNI, Kotlin/UI, and VST hosts are intentionally outside this repository.
 
+## Clone and initialize
+
+```bash
+git clone --recurse-submodules https://github.com/Varcain/liblowlatencyaudio.git
+# Existing clone:
+git submodule update --init --recursive
+```
+
+Android builds require the pinned `third_party/libusb` submodule. The CMake
+configure step fails with the initialization command when it is absent.
+
 ## Build and link
 
 ```cmake
@@ -10,6 +21,22 @@ target_link_libraries(app PRIVATE lowlatencyaudio::lowlatencyaudio)
 ```
 
 On Android the root project builds the pinned bundled libusb USBFS backend (submodule commit `578ab76b4c434f8b204137ab6d7310689c7a9704`). Host tests use system libusb. Do not add a second driver or libusb target in the consumer.
+
+Standalone contract tests are opt-in:
+
+```bash
+cmake -S . -B build -DLOWLATENCYAUDIO_BUILD_TESTS=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+The test configure fetches immutable GoogleTest commit
+`f8d7d77c06936315286eb55f8de22cd23c188571` and therefore needs network access
+unless FetchContent is already populated. Host `usb_driver_tests` additionally
+require `pkg-config` and `libusb-1.0`; without them the scheduling and Linux CPU
+affinity contracts still build, while driver lifecycle tests are reported as
+disabled.
+
 
 The include tree preserves the existing C++ namespaces and API. Only ownership and include paths change when integrating as a subdirectory or local git submodule.
 
@@ -55,6 +82,13 @@ Rejected as generic solutions: global `-ffast-math`/`-Ofast`, `-mcpu=native`, fi
 A passing stress run establishes only ring starvation/overflow counters, libusb statuses, explicit silence insertion, deadline/lifecycle transitions, and conserved frame accounting. It does not prove microframe timing, device FIFO/PLL continuity, analog output continuity, packet payload correctness, or absence of a short pending-transfer runway gap.
 
 Use `tools/analyze_direct_usb_telemetry.py` for structured logcat records and `docs/measurement.md` for calibration, flight-recorder, usbmon/hardware-analyzer, deterministic impulse, and analog-loopback methodology. Always record format, buffer, multiplier, cycles, host queue label, and whether analog latency was measured. Recalibrate the minimum stable watermark after each verified change; only a lower stable queue with zero failures is a latency improvement.
+
+## Licensing
+
+The driver pack is GPL-3.0-or-later; see `LICENSE`. Bundled libusb remains
+LGPL-2.1-or-later under its upstream notices and
+`third_party/libusb/COPYING`. Preserve both license sets and comply with their
+distribution requirements when shipping binaries.
 
 ## Source notes
 
