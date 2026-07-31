@@ -1,0 +1,3 @@
+[submodule "third_party/libusb"]
+	path = third_party/libusb
+    url = https://github.com/libusb/libusb.git
