@@ -15,6 +15,7 @@ PRIMARY_REQUIRED = ("cycle", "state", "failure", "actual_xrun_growth", "capture_
                     "deadline_miss_growth", "last_dsp_ns", "peak_dsp_ns", "last_cycle_ns",
                     "peak_cycle_ns", "deadline_budget_ns", "known_host_latency_frames")
 LIFECYCLE_REQUIRED = ("lifecycle_after_stop", "state", "failure", "lifecycle_failures")
+SUPPORTED_SCHEMAS = frozenset((3, 4, 5, 6, 7))
 
 
 def parse_value(value):
@@ -56,8 +57,9 @@ def records_from(streams, parse_diagnostics=None, audit_summaries=None):
                 missing.append("valid lifecycle-after-stop status")
             if missing:
                 errors.append("%s:%d malformed TELEMETRY missing=%s" % (name, lineno, ",".join(missing)))
-            elif not isinstance(schema, int) or isinstance(schema, bool) or schema not in (3, 4, 5):
-                errors.append("%s:%d unsupported TELEMETRY schema=%r (expected 3, 4, or 5)" % (name, lineno, schema))
+            elif not isinstance(schema, int) or isinstance(schema, bool) or schema not in SUPPORTED_SCHEMAS:
+                errors.append("%s:%d unsupported TELEMETRY schema=%r (expected one of %s)" %
+                              (name, lineno, schema, ", ".join(map(str, sorted(SUPPORTED_SCHEMAS)))))
             else:
                 records.append(fields)
     return records
