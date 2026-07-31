@@ -53,7 +53,7 @@ The include tree preserves the existing C++ namespaces and API. Only ownership a
 
 - Bounded lock-free SPSC rings carry capture/playback PCM. Producers publish complete frames only; consumers never observe partial frames.
 - USB transfers use a preallocated isochronous pool. No allocation, blocking mutex, unbounded loop, logging, or filesystem work is allowed on the realtime callback or USB completion path.
-- `eventfd` wakeups connect bounded state changes to the event thread. Stop has an explicit wakeup; lost-wakeup protection is part of the lifecycle contract.
+- `eventfd` wakeups connect bounded capture/playback state changes to waiting threads. Stop signals those waiters; libusb event-thread exit is bounded by cancellation callbacks and its event timeout.
 - Playback admission is whole-transfer: defer an OUT transfer unless all PCM and (for implicit feedback) all packet metadata are available. Deferred transfers retain FIFO order and are never padded with fabricated layouts or silence.
 - Implicit-feedback devices use capture-derived packet layout FIFO. Capture starts before playback; each successful capture packet's frame count is paired with the corresponding OUT packet.
 - Variable packet lengths must use `libusb_get_iso_packet_buffer()`, never `_simple`, because `_simple` assumes equal descriptor lengths and corrupts payload offsets.

@@ -23,4 +23,4 @@ The Audient topology has asynchronous OUT and asynchronous implicit-feedback IN 
 
 ## Lifecycle API expectations
 
-Start and stop are explicit and idempotence is handled by the owner. Stop must halt production, cease submissions, reap transfers, wake and join threads, release interfaces, and close native state before the Java FD is closed. Detach and permission failures are terminal for that FD. Reconnect requires a fresh probe and fresh transfer pool.
+Start and stop are explicit and idempotence is handled by the owner. Stop must halt production, cease submissions, reap transfers, signal capture/playback waiters, join threads after the bounded libusb event timeout/cancellation drain, release interfaces, and close native state before the Java FD is closed. Detach and permission failures are terminal for that FD. Reconnect requires a fresh probe and fresh transfer pool.

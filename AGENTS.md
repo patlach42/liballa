@@ -24,7 +24,7 @@ The Audient iD4 profile is device-scoped and evidence-backed. Unknown devices ke
 
 ## Ownership and lifecycle
 
-One component owns each ring cursor; release/acquire publication must preserve complete-frame visibility. Transfer pool slots, metadata FIFO, eventfd, and worker threads have explicit owners. Stop production first, stop/reap transfers, issue stop wakeup, join event/RT threads, release interfaces, then native close; Java closes `UsbDeviceConnection` last. Reconnect only after old state is quiescent.
+One component owns each ring cursor; release/acquire publication must preserve complete-frame visibility. Transfer pool slots, metadata FIFO, eventfd, and worker threads have explicit owners. Stop production first, stop/reap transfers, signal capture/playback waiters, join event/RT threads, release interfaces, then native close; Java closes `UsbDeviceConnection` last. Reconnect only after old state is quiescent.
 
 ## Build and test commands
 
