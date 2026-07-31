@@ -5,7 +5,8 @@ Autonomous C++17 Android direct-USB UAC low-latency driver pack. The public CMak
 ## Clone and initialize
 
 ```bash
-git clone --recurse-submodules https://github.com/Varcain/liblowlatencyaudio.git
+# The repository is currently local-only. After publishing its canonical remote:
+git clone --recurse-submodules <liblowlatencyaudio-remote>
 # Existing clone:
 git submodule update --init --recursive
 ```
