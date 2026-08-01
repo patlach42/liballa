@@ -55,6 +55,10 @@ public:
         stop();
         driver_.close();
     }
+    bool configureUserspaceBuffers(
+            const monotrypt::usb::UserspaceBufferConfig& config) {
+        return driver_.configureUserspaceBuffers(config);
+    }
 
     bool start(int sampleRate, int bitsPerSample, int bytesPerSample, int channels,
                int outputPair) {
@@ -258,11 +262,11 @@ public:
     uint64_t playbackBackpressureCount() const noexcept {
         return driver_.playbackBackpressureCount();
     }
-    void setGraphQuantum(
+    void setUserspaceBufferConfig(
             int frames,
-            int periodMultiplier = monotrypt::usb::kDefaultPeriodMultiplier,
-            int watermarkFrames = 0) noexcept {
-        driver_.setGraphQuantum(frames, periodMultiplier, watermarkFrames);
+            const monotrypt::usb::UserspaceBufferConfig& config,
+            int periodMultiplier = monotrypt::usb::kDefaultPeriodMultiplier) noexcept {
+        driver_.setUserspaceBufferConfig(frames, config, periodMultiplier);
     }
     int bufferedFrames() const noexcept { return driver_.bufferedFrames(); }
     int writableFrames() const noexcept { return driver_.writableFrames(); }

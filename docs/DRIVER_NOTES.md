@@ -139,6 +139,49 @@ buffer 16, and multiplier 3:
 - observed host queue estimate was 313-346 frames, or 6.52-7.21 ms. This is
   host-side accounting, not analog end-to-end latency.
 
+## Explicit userspace buffering controls
+
+The previous userspace watermark implementation combined a user value with
+hidden safety floors. A positive watermark was raised to the automatic target,
+the graph quantum was added during write admission, the Audient profile added a
+hidden nine-transfer reserve, and the thermal policy could temporarily add two
+graph quanta. This made the visible setting an unreliable latency control.
+
+The current contract exposes the latency terms separately:
+
+- **Playback target**: exact steady-state userspace playback target. `0` uses
+  the documented automatic policy; a positive value is not raised by a device
+  profile or thermal policy.
+- **Startup prime**: exact prefill before the first OUT submission. `0` uses
+  the automatic prime. It must still fit the physical ring and contain the
+  negotiated initial packet descriptors.
+- **Write headroom**: explicit admission headroom independent of the graph
+  quantum. `0` selects the documented automatic headroom.
+- **Capture queue limit**: explicit capture-read limit. `0` selects the derived
+  transfer/playback runway policy.
+- **Transfer count** and **packets per transfer**: `0` selects endpoint/profile
+  geometry; positive values are bounded to `1..8` and validated before pump
+  allocation. These are transport tuning controls, not guaranteed latency
+  improvements.
+- **Ring capacity**: both SPSC rings use the selected power-of-two byte capacity
+  (`4..1024 KiB`) and apply it only at the next engine start. Resizing requires
+  stopping the USB event/pump threads before replacing callback-visible storage;
+  it is a physical storage ceiling, not an automatic latency target.
+
+Invalid combinations fail startup rather than being silently raised. In
+particular, `playback target + write headroom` must fit the selected ring, and
+startup prime must fit the ring and the exact initial USB packet runway.
+
+The thermal safety policy was removed from the default path so explicit queue
+settings remain stable during a session. If reintroduced, it must be an
+explicit setting with visible state and telemetry showing when it raises the
+target. Performance hints may continue without changing queue geometry.
+
+Native contract tests cover exact target/headroom admission and invalid target
+combinations. APK assembly and the standalone liblowlatencyaudio test suite
+were run after this change; physical-device verification requires an attached
+ADB target.
+
 ## Measurement contract
 
 A passing host stress run establishes only the observed invariants:

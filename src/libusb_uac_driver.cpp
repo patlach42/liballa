@@ -252,9 +252,9 @@ bool LibusbUacDriver::open(int fileDescriptor, int driverCode) {
     line6Profile_ = driverCode_ == 1;
     if (line6Profile_ && (descriptorResult != LIBUSB_SUCCESS ||
         descriptor.idVendor != 0x0e41 ||
-        (descriptor.idProduct != 0x4141 && descriptor.idProduct != 0x4150))) {
+        (descriptor.idProduct != 0x4141 && descriptor.idProduct != 0x4150 && descriptor.idProduct != 0x5555))) {
         std::lock_guard<std::mutex> e(errorMutex_);
-        lastErrorDetail_ = "Line6 driver requires UX1 VID/PID 0e41:4141 or 0e41:4150";
+        lastErrorDetail_ = "Line6 driver requires Line6 UX1 VID/PID 0e41:[4141,4150,5555]";
         libusb_close(device_); device_ = nullptr; fd_ = -1; return false;
     }
     lowLatencyProfile_ = descriptorResult == LIBUSB_SUCCESS &&
@@ -1735,10 +1735,11 @@ bool LibusbUacDriver::startCapturePump() {
     captureFrameStride_.store(captureStride, std::memory_order_release);
     const int capturePacketsPerSecond = packetsPerSecondForInterval(
         captureFormat_.isHighSpeed, captureFormat_.bInterval);
-    capturePacketsPerTransfer_ =
-        lowLatencyProfile_ && capturePacketsPerSecond >= 8000
+    capturePacketsPerTransfer_ = userspaceBufferConfig_.packetsPerTransfer != 0
+        ? userspaceBufferConfig_.packetsPerTransfer
+        : (lowLatencyProfile_ && capturePacketsPerSecond >= 8000
             ? kId4PacketsPerTransfer
-            : packetsPerTransferForRate(capturePacketsPerSecond);
+            : packetsPerTransferForRate(capturePacketsPerSecond));
     const int packets = capturePacketsPerTransfer_;
     const int captureNominalMax =
         (captureFormat_.sampleRateHz + capturePacketsPerSecond - 1) /
@@ -1944,6 +1945,10 @@ int LibusbUacDriver::captureFrameLimit() const noexcept {
                                      playbackBudget));
     const int physicalLimit =
         static_cast<int>(captureRing_.size() / static_cast<size_t>(stride));
+    const int configuredLimit = captureLimitFrames_.load(std::memory_order_acquire);
+    if (configuredLimit > 0) {
+        return std::min(physicalLimit, configuredLimit);
+    }
     return std::min(physicalLimit, latencyLimit);
 }
 
@@ -2175,10 +2180,11 @@ bool LibusbUacDriver::startIsoPump(bool submit) {
         : std::max<int>(1, format_.bInterval);
     microframesPerSec_ =
         std::max(1, hostPeriodHz / packetIntervalUframes_);
-    playbackPacketsPerTransfer_ =
-        lowLatencyProfile_ && microframesPerSec_ >= 8000
+    playbackPacketsPerTransfer_ = userspaceBufferConfig_.packetsPerTransfer != 0
+        ? userspaceBufferConfig_.packetsPerTransfer
+        : (lowLatencyProfile_ && microframesPerSec_ >= 8000
             ? kId4PacketsPerTransfer
-            : packetsPerTransferForRate(microframesPerSec_);
+            : packetsPerTransferForRate(microframesPerSec_));
     int baseFrames = format_.sampleRateHz / microframesPerSec_;
     int rateRemainder = format_.sampleRateHz % microframesPerSec_;
     LOGI("iso pump: %d packets/sec (HS=%d, bInterval=%u), "
@@ -2693,7 +2699,7 @@ int LibusbUacDriver::drainRing(uint8_t* dst, int bytes) {
     int n = static_cast<int>(std::min<size_t>(available, static_cast<size_t>(bytes)));
     if (n > 0) {
         size_t off = tail & ringMask_;
-        size_t first = std::min<size_t>(n, kRingBytes - off);
+        size_t first = std::min<size_t>(n, ring_.size() - off);
         std::memcpy(dst, ring_.data() + off, first);
         if (first < static_cast<size_t>(n)) {
             std::memcpy(dst + first, ring_.data(), n - first);
@@ -2745,7 +2751,7 @@ LibusbUacDriver::preparePlaybackWrite(int requestedFrames) noexcept {
     const size_t frameLimit = static_cast<size_t>(
         (started ? playbackTargetFrames_.load(std::memory_order_acquire)
                  : startupPrimeFrames_.load(std::memory_order_acquire)) +
-        graphQuantum_.load(std::memory_order_acquire));
+        writeHeadroomFrames_.load(std::memory_order_acquire));
     const size_t physicalFrames =
         (ring_.size() - queuedBytes) / static_cast<size_t>(frameStride);
     const size_t logicalFrames =
@@ -2816,40 +2822,81 @@ int LibusbUacDriver::bufferedFrames() const {
 
 void LibusbUacDriver::setGraphQuantum(
         int frames, int periodMultiplier, int watermarkFrames) {
-    const auto config = playbackWatermarkConfig(frames, periodMultiplier);
+    UserspaceBufferConfig config = userspaceBufferConfig_;
+    config.playbackTargetFrames = watermarkFrames;
+    setUserspaceBufferConfig(frames, config, periodMultiplier);
+}
+
+bool LibusbUacDriver::configureUserspaceBuffers(
+        const UserspaceBufferConfig& config) {
+    if (streaming_.load(std::memory_order_acquire) ||
+        playbackStarted_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const size_t requestedCapacity = config.ringCapacityBytes == 0
+        ? kRingBytes : config.ringCapacityBytes;
+    if (requestedCapacity < 4096 || requestedCapacity > (1u << 20) ||
+        (requestedCapacity & (requestedCapacity - 1)) != 0 ||
+        (config.transferCount != 0 &&
+         (config.transferCount < 1 || config.transferCount > kMaxTransferCount)) ||
+        (config.packetsPerTransfer != 0 &&
+         (config.packetsPerTransfer < kMinPacketsPerTransfer ||
+          config.packetsPerTransfer > kMaxPacketsPerTransfer)) ||
+        config.playbackTargetFrames < 0 || config.startupPrimeFrames < 0 ||
+        config.writeHeadroomFrames < 0 || config.captureLimitFrames < 0) {
+        return false;
+    }
+    ring_.assign(requestedCapacity, 0);
+    captureRing_.assign(requestedCapacity, 0);
+    ringMask_ = requestedCapacity - 1;
+    captureRingMask_ = requestedCapacity - 1;
+    ringHead_.store(0, std::memory_order_release);
+    ringTail_.store(0, std::memory_order_release);
+    captureHead_.store(0, std::memory_order_release);
+    captureTail_.store(0, std::memory_order_release);
+    userspaceBufferConfig_ = config;
+    transferCount_ = config.transferCount != 0
+        ? config.transferCount
+        : (lowLatencyProfile_ ? kId4NumTransfers : kDefaultNumTransfers);
+    return true;
+}
+
+void LibusbUacDriver::setUserspaceBufferConfig(
+        int frames, const UserspaceBufferConfig& userConfig,
+        int periodMultiplier) {
+    const auto autoConfig = playbackWatermarkConfig(frames, periodMultiplier);
     const int stride = format_.channels * format_.bytesPerSample;
     const int physicalFrames = stride > 0
-        ? static_cast<int>(kRingBytes / static_cast<size_t>(stride))
-        : config.frameLimit;
-    const int maxTarget = std::max(0, physicalFrames - config.graphQuantum);
-    // Generic devices retain their conservative userspace floor. The
-    // calibrated iD4 watermark counts only completed-transfer reserve here:
-    // its in-flight USB frames are already queued independently at the DAC.
-    const int physicalTransferFrames =
-        std::max(1, playbackPacketsPerTransfer_) *
-        std::max(0, maxFramesPerPacket_);
-    const int transferFrames = lowLatencyProfile_
-        ? nominalTransferFrames(format_.sampleRateHz,
-                                playbackPacketsPerTransfer_,
-                                microframesPerSec_)
-        : physicalTransferFrames;
-    // Keep the calibrated iD4 hidden reserve at nine transfers; generic
-    // devices retain their existing one-transfer reserve.
-    const int reserveTransfers =
-        clampPeriodMultiplier(periodMultiplier) +
-        (lowLatencyProfile_ ? 9 : 1);
-    const int watermarkTransfers = playbackWatermarkTransferCount(
-        transferCount_, reserveTransfers, lowLatencyProfile_);
-    const int queuedTransferFrames = watermarkTransfers * transferFrames;
-    const int automaticTarget = effectivePlaybackTargetFrames(
-        config.targetFrames, queuedTransferFrames);
-    const int target = resolvedPlaybackTargetFrames(
-        automaticTarget, watermarkFrames, config.graphQuantum, maxTarget);
-    const int prime = startupPlaybackPrimeFrames(maxTarget, exactInitialPacketFrames_, target, config.graphQuantum);
-    graphQuantum_.store(config.graphQuantum, std::memory_order_release);
+        ? static_cast<int>(ring_.size() / static_cast<size_t>(stride))
+        : 0;
+    const int maxTarget = std::max(0, physicalFrames);
+    const int automaticTarget = autoConfig.targetFrames;
+    const int target = userConfig.playbackTargetFrames == 0
+        ? std::min(maxTarget, automaticTarget)
+        : userConfig.playbackTargetFrames;
+    const int headroom = userConfig.writeHeadroomFrames == 0
+        ? autoConfig.graphQuantum
+        : userConfig.writeHeadroomFrames;
+    const int automaticPrime = startupPlaybackPrimeFrames(
+        maxTarget, exactInitialPacketFrames_, target, headroom);
+    const int prime = userConfig.startupPrimeFrames == 0
+        ? automaticPrime : userConfig.startupPrimeFrames;
+    if (target < 0 || prime < 0 || headroom < 0 ||
+        target + headroom > maxTarget || prime > maxTarget ||
+        prime < exactInitialPacketFrames_) {
+        playbackTargetFrames_.store(0, std::memory_order_release);
+        startupPrimeFrames_.store(0, std::memory_order_release);
+        writeHeadroomFrames_.store(0, std::memory_order_release);
+        captureLimitFrames_.store(0, std::memory_order_release);
+        return;
+    }
+    graphQuantum_.store(autoConfig.graphQuantum, std::memory_order_release);
     playbackTargetFrames_.store(target, std::memory_order_release);
     startupPrimeFrames_.store(prime, std::memory_order_release);
+    writeHeadroomFrames_.store(headroom, std::memory_order_release);
+    captureLimitFrames_.store(userConfig.captureLimitFrames, std::memory_order_release);
 }
+
 
 int LibusbUacDriver::writableFrames() const {
     const int frameStride = format_.channels * format_.bytesPerSample;
@@ -2861,8 +2908,8 @@ int LibusbUacDriver::writableFrames() const {
     const size_t frameLimit = static_cast<size_t>(
         (started ? playbackTargetFrames_.load(std::memory_order_acquire)
                  : startupPrimeFrames_.load(std::memory_order_acquire)) +
-        graphQuantum_.load(std::memory_order_acquire));
-    const size_t physicalFree = (kRingBytes - (head - tail)) /
+        writeHeadroomFrames_.load(std::memory_order_acquire));
+    const size_t physicalFree = (ring_.size() - (head - tail)) /
                                 static_cast<size_t>(frameStride);
     const size_t logicalFree = queuedFrames < frameLimit ? frameLimit - queuedFrames : 0;
     return static_cast<int>(std::min(physicalFree, logicalFree));

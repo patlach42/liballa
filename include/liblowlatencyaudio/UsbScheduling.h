@@ -21,6 +21,22 @@ struct PlaybackWatermarkConfig {
     int frameLimit;
 };
 
+// Every userspace latency term is either explicit or uses the documented
+// automatic policy when its value is zero. Transfer geometry must be selected
+// before the ISO pumps are allocated; the other fields are applied after
+// stream negotiation.
+struct UserspaceBufferConfig {
+    // Zero selects the documented automatic policy. Positive values are exact
+    // requests; unsupported values fail startup instead of being raised.
+    int playbackTargetFrames = 0;
+    int startupPrimeFrames = 0;
+    int writeHeadroomFrames = 0;
+    int captureLimitFrames = 0;
+    int transferCount = 0;
+    int packetsPerTransfer = 0;
+    size_t ringCapacityBytes = 0;
+};
+
 constexpr int kDefaultPeriodMultiplier = 3;
 constexpr int kMinPeriodMultiplier = 1;
 constexpr int kMaxPeriodMultiplier = 8;

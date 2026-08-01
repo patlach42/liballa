@@ -266,11 +266,17 @@ public:
         return playbackTargetFrames_.load(std::memory_order_acquire);
     }
     int bufferedFrames() const;
-    // Set graph quantum and playback watermark. A positive watermarkFrames is
-    // an explicit userspace target; zero selects the device-derived policy.
+    // Applies all userspace buffering policy before stream start. Positive
+    // values are exact; zero selects documented automatic behaviour.
+    bool configureUserspaceBuffers(
+        const UserspaceBufferConfig& config);
+    void setUserspaceBufferConfig(
+        int frames, const UserspaceBufferConfig& config,
+        int periodMultiplier = kDefaultPeriodMultiplier);
+    // Compatibility helper for native tests and legacy embedders. New code
+    // uses setUserspaceBufferConfig so every queue term remains explicit.
     void setGraphQuantum(
-        int frames,
-        int periodMultiplier = kDefaultPeriodMultiplier,
+        int frames, int periodMultiplier = kDefaultPeriodMultiplier,
         int watermarkFrames = 0);
 
     // Returns true when the iso pump is already streaming a stream
@@ -436,6 +442,9 @@ private:
     std::atomic<int> graphQuantum_{64};
     std::atomic<int> playbackTargetFrames_{128};
     std::atomic<int> startupPrimeFrames_{128};
+    std::atomic<int> writeHeadroomFrames_{64};
+    std::atomic<int> captureLimitFrames_{0};
+    UserspaceBufferConfig userspaceBufferConfig_{};
     std::atomic<uint64_t> queuedOutFrames_{0};
     mutable std::mutex mutex_;          // guards open/start/stop only
     mutable std::recursive_mutex sessionMutex_; // serializes start/duplex/stop

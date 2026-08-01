@@ -446,6 +446,50 @@ TEST(UsbDriverRing, PartialAdmissionReportsWholeFramesAndCallerCanSubmitTail) {
               std::vector<uint8_t>(input.begin() + submitted * frameStride,
                                     input.end()));
 }
+TEST(UsbDriverUserspaceBuffer, ExplicitTargetAndHeadroomBoundWritableAdmission) {
+    monotrypt::usb::LibusbUacDriver driver;
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
+
+    monotrypt::usb::UserspaceBufferConfig config;
+    config.playbackTargetFrames = 8;
+    config.startupPrimeFrames = 8;
+    config.writeHeadroomFrames = 3;
+    config.ringCapacityBytes = 4096;
+    ASSERT_TRUE(driver.configureUserspaceBuffers(config));
+
+    // The automatic target for a 16-frame graph quantum is 48 frames. An
+    // explicit target remains exact rather than being raised to that floor.
+    driver.setUserspaceBufferConfig(16, config);
+    EXPECT_EQ(driver.playbackTargetFrames(), 8);
+    EXPECT_EQ(driver.startupPrimeFrames(), 8);
+
+    monotrypt::usb::UsbDriverTestAccess::playbackStarted(driver, true);
+    std::vector<uint8_t> input(20 * 4, 0xA5);
+    EXPECT_EQ(driver.writePcm(input.data(), 20), 11);
+    EXPECT_EQ(driver.bufferedFrames(), 11);
+    EXPECT_EQ(driver.writableFrames(), 0);
+}
+
+TEST(UsbDriverUserspaceBuffer, InvalidTargetAndHeadroomCannotAdmitFrames) {
+    monotrypt::usb::LibusbUacDriver driver;
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
+
+    monotrypt::usb::UserspaceBufferConfig config;
+    config.playbackTargetFrames = 1020;
+    config.startupPrimeFrames = 1;
+    config.writeHeadroomFrames = 5;
+    config.ringCapacityBytes = 4096;  // 1024 frames at 4 bytes per frame.
+    ASSERT_TRUE(driver.configureUserspaceBuffers(config));
+
+    driver.setUserspaceBufferConfig(16, config);
+    EXPECT_EQ(driver.playbackTargetFrames(), 0);
+    EXPECT_EQ(driver.startupPrimeFrames(), 0);
+    EXPECT_EQ(driver.writableFrames(), 0);
+
+    std::vector<uint8_t> input(8 * 4, 0x5A);
+    EXPECT_EQ(driver.writePcm(input.data(), 8), 0);
+    EXPECT_EQ(driver.bufferedFrames(), 0);
+}
 
 TEST(UsbDriverCapture, InactiveCaptureGatesReadsAndStaleCompletion) {
     resetMock();
