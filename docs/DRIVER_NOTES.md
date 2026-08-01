@@ -182,6 +182,21 @@ combinations. APK assembly and the standalone liblowlatencyaudio test suite
 were run after this change; physical-device verification requires an attached
 ADB target.
 
+## Opt-in thermal safety policy
+
+Thermal queue expansion is disabled by default and persisted as an explicit
+Direct USB setting. When enabled for a new session, the policy samples thermal
+headroom on its control thread and uses hysteresis:
+
+- enter safety at headroom `>= 0.85`, raising the current target by `2 * graphQuantum`;
+- leave safety at headroom `<= 0.65`, restoring the configured target;
+- disabling the setting also restores the configured target on the next policy tick.
+
+The UI reports both the persisted opt-in and native runtime state. The policy
+does not alter graph quantum, ring capacity, startup prime, or capture limits.
+It only changes the temporary playback watermark and always restores the
+configured value after recovery.
+
 ## Measurement contract
 
 A passing host stress run establishes only the observed invariants:

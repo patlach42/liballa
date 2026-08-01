@@ -268,6 +268,12 @@ public:
             int periodMultiplier = monotrypt::usb::kDefaultPeriodMultiplier) noexcept {
         driver_.setUserspaceBufferConfig(frames, config, periodMultiplier);
     }
+    void setGraphQuantum(
+            int frames,
+            int periodMultiplier = monotrypt::usb::kDefaultPeriodMultiplier,
+            int watermarkFrames = 0) noexcept {
+        driver_.setGraphQuantum(frames, periodMultiplier, watermarkFrames);
+    }
     int bufferedFrames() const noexcept { return driver_.bufferedFrames(); }
     int writableFrames() const noexcept { return driver_.writableFrames(); }
     uint64_t captureXRunCount() const noexcept {
