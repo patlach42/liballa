@@ -1,4 +1,5 @@
 # liblowlatencyaudio
+NNAGA (NNAGA Not Android Guitar App) owns and maintains this driver pack; project identity and ownership are attributed to patlach42.
 
 Autonomous C++17 Android direct-USB UAC low-latency driver pack. The public CMake target is `lowlatencyaudio::lowlatencyaudio`; it contains `LibusbUacDriver`, `UsbScheduling`, and the float `DirectUsbOutput` adapter. AudioEngine, RackGraph, plugins, JNI, Kotlin/UI, and VST hosts are intentionally outside this repository.
 

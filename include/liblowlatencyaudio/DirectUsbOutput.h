@@ -1,16 +1,16 @@
 /*
- * Copyright (C) 2026 Kamil Lulko <kamil.lulko@gmail.com>
+ * Copyright (C) 2026 patlach42
  *
- * This file is part of Guitar RackCraft.
+ * This file is part of NNAGA.
  *
- * Guitar RackCraft is free software: you can redistribute it and/or modify
+ * NNAGA is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
  */
 
-#ifndef GUITARRACKCRAFT_DIRECT_USB_OUTPUT_H
-#define GUITARRACKCRAFT_DIRECT_USB_OUTPUT_H
+#ifndef NNAGA_DIRECT_USB_OUTPUT_H
+#define NNAGA_DIRECT_USB_OUTPUT_H
 
 #include "liblowlatencyaudio/libusb_uac_driver.h"
 #include <algorithm>
@@ -456,4 +456,4 @@ private:
 
 } // namespace guitarrackcraft
 
-#endif // GUITARRACKCRAFT_DIRECT_USB_OUTPUT_H
+#endif // NNAGA_DIRECT_USB_OUTPUT_H
