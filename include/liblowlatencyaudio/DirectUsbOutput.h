@@ -22,6 +22,7 @@
 #include <mutex>
 #include <thread>
 #include <string>
+#include <chrono>
 #include <vector>
 
 namespace guitarrackcraft {
@@ -100,6 +101,7 @@ public:
         outputPair_ = outputPair;
         // The render thread must fill the ring before startPlayback() arms OUT.
         accepting_.store(true, std::memory_order_release);
+        playbackQuantumDrops_.store(0, std::memory_order_relaxed);
         streaming_.store(true, std::memory_order_release);
         return true;
     }
@@ -138,6 +140,12 @@ public:
         driver_.requestStop();
     }
 
+    int captureAvailableFrames() const noexcept {
+        return driver_.captureAvailableFrames();
+    }
+    int captureCapacityFrames() const noexcept {
+        return driver_.captureCapacityFrames();
+    }
     int captureChannelCount() const noexcept {
         return driver_.captureChannelCount();
     }
@@ -162,50 +170,48 @@ public:
     bool adapterStreaming() const noexcept {
         return streaming_.load(std::memory_order_acquire);
     }
+    void resetRealtimeCounters() noexcept {
+        driver_.resetRealtimeCounters();
+    }
     bool driverStreaming() const noexcept {
         return driver_.isStreaming();
     }
 
-    // Called only from the dedicated render thread. No allocation, locks,
-    // I/O, or blocking calls occur here. Returns the number of whole frames
-    // admitted to the playback ring so the caller can retry an unqueued tail.
-    int writeStereo(const float* left, const float* right, int frames) noexcept {
+    // Called only from the dedicated render thread. Admits one complete
+    // quantum without waiting. A full or partially writable ring drops the
+    // newest quantum; no partial commit is ever published.
+    bool submitWholeQuantum(const float* left, const float* right,
+                            int frames) noexcept {
         if (!left || !right || frames <= 0 ||
-            !accepting_.load(std::memory_order_acquire)) return 0;
-        activeWriters_.fetch_add(1, std::memory_order_acq_rel);
-        if (!accepting_.load(std::memory_order_acquire)) {
-            activeWriters_.fetch_sub(1, std::memory_order_release);
-            return 0;
+            frames > kMaxFramesPerWrite ||
+            !accepting_.load(std::memory_order_acquire)) {
+            return false;
         }
-
-        int offset = 0;
-        while (offset < frames) {
-            const int requested = std::min(
-                frames - offset, kMaxFramesPerWrite);
-            const auto region = driver_.preparePlaybackWrite(requested);
-            if (region.frames <= 0) break;
-            switch (formatBits_) {
-                case 16:
-                    packPlaybackRegion<16>(
-                        region, left + offset, right + offset);
-                    break;
-                case 24:
-                    packPlaybackRegion<24>(
-                        region, left + offset, right + offset);
-                    break;
-                case 32:
-                    packPlaybackRegion<32>(
-                        region, left + offset, right + offset);
-                    break;
-                default:
-                    break;
+        activeWriters_.fetch_add(1, std::memory_order_acq_rel);
+        bool submitted = false;
+        if (accepting_.load(std::memory_order_acquire) &&
+            driver_.writableFrames() >= frames) {
+            const auto region = driver_.preparePlaybackWrite(frames);
+            if (region.frames == frames) {
+                switch (formatBits_) {
+                    case 16: packPlaybackRegion<16>(region, left, right); break;
+                    case 24: packPlaybackRegion<24>(region, left, right); break;
+                    case 32: packPlaybackRegion<32>(region, left, right); break;
+                    default: break;
+                }
+                if (formatBits_ == 16 || formatBits_ == 24 || formatBits_ == 32) {
+                    driver_.commitPlaybackWrite(region);
+                    submitted = true;
+                }
             }
-            driver_.commitPlaybackWrite(region);
-            offset += region.frames;
-            if (region.frames < requested) break;
         }
         activeWriters_.fetch_sub(1, std::memory_order_release);
-        return offset;
+        if (!submitted) playbackQuantumDrops_.fetch_add(1, std::memory_order_relaxed);
+        return submitted;
+    }
+
+    uint64_t playbackQuantumDrops() const noexcept {
+        return playbackQuantumDrops_.load(std::memory_order_relaxed);
     }
 
     // Reads all negotiated capture channels as normalized channel-major planes.
@@ -242,6 +248,10 @@ public:
 
     bool waitForCaptureFrames(int frames, int timeoutMs) const noexcept {
         return driver_.waitForCaptureFrames(frames, timeoutMs);
+    }
+    bool waitForCaptureUntil(
+            int frames, std::chrono::steady_clock::time_point deadline) const noexcept {
+        return driver_.waitForCaptureFramesUntil(frames, deadline);
     }
     bool waitForWritableFrames(int frames, int timeoutMs) const noexcept {
         return driver_.waitForWritableFrames(frames, timeoutMs);
@@ -452,6 +462,7 @@ private:
     std::atomic<bool> accepting_{false};
     std::atomic<bool> streaming_{false};
     std::atomic<uint32_t> activeWriters_{0};
+    std::atomic<uint64_t> playbackQuantumDrops_{0};
 };
 
 } // namespace guitarrackcraft

@@ -18,6 +18,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -172,6 +173,9 @@ public:
     void close();
     bool isOpen() const { return device_ != nullptr; }
     bool waitForCaptureFrames(int frames, int timeoutMs) const;
+    bool waitForCaptureFramesUntil(
+        int frames, std::chrono::steady_clock::time_point deadline) const;
+    int captureCapacityFrames() const noexcept { return captureFrameLimit(); }
 
     // Negotiates UAC2 alt setting matching the requested format,
     // claims the streaming interface, sets the clock source rate via
@@ -191,6 +195,11 @@ public:
         return {captureOverruns_.load(std::memory_order_acquire),
                 captureUnderruns_.load(std::memory_order_acquire),
                 captureSequence_.load(std::memory_order_acquire)};
+    }
+    void resetRealtimeCounters() noexcept {
+        captureOverruns_.store(0, std::memory_order_relaxed);
+        captureUnderruns_.store(0, std::memory_order_relaxed);
+        playbackUnderruns_.store(0, std::memory_order_relaxed);
     }
     int discardCaptureFrames(int maxFrames) noexcept;
     ImplicitFeedbackStats implicitFeedbackStats() const noexcept {
@@ -504,6 +513,7 @@ private:
     std::atomic<uint64_t> deferredTransfers_{0};
     std::atomic<uint64_t> metadataFifoOverruns_{0};
     std::atomic<uint64_t> captureTransferErrors_{0};
+    std::atomic<uint64_t> capturePacketDrops_{0};
     std::atomic<uint64_t> playbackTransferErrors_{0};
     std::atomic<uint64_t> lifecycleFailures_{0};
     std::atomic<bool> transportFailed_{false};

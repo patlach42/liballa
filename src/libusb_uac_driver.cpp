@@ -118,6 +118,26 @@ bool pollWakeFd(int fd, int timeoutMs) noexcept {
     do { result = poll(&pfd, 1, timeoutMs); } while (result < 0 && errno == EINTR);
     return result > 0;
 }
+bool pollWakeFdUntil(
+        int fd, std::chrono::steady_clock::time_point deadline) noexcept {
+    if (fd < 0) return false;
+    pollfd descriptor{fd, POLLIN, 0};
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return false;
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now);
+        timespec timeout{
+            static_cast<time_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(remaining).count()),
+            static_cast<long>(
+                (remaining % std::chrono::seconds(1)).count())
+        };
+        const int result = ppoll(&descriptor, 1, &timeout, nullptr);
+        if (result >= 0) return result > 0;
+        if (errno != EINTR) return false;
+    }
+}
 
 LibusbUacDriver::LibusbUacDriver() {
     ring_.resize(kRingBytes);
@@ -1244,6 +1264,7 @@ bool LibusbUacDriver::start(int sampleRateHz, int bitsPerSample, int channels,
         captureOverruns_.store(0, std::memory_order_relaxed);
         metadataFifoOverruns_.store(0, std::memory_order_relaxed);
         captureUnderruns_.store(0, std::memory_order_relaxed);
+        capturePacketDrops_.store(0, std::memory_order_relaxed);
         streaming_.store(false, std::memory_order_release);
     }
 
@@ -1636,6 +1657,7 @@ bool LibusbUacDriver::startDuplex(int sampleRateHz, int bitsPerSample,
                     captureTail_.store(0, std::memory_order_relaxed);
                     captureOverruns_.store(0, std::memory_order_relaxed);
                     captureUnderruns_.store(0, std::memory_order_relaxed);
+                    capturePacketDrops_.store(0, std::memory_order_relaxed);
                     captureSequence_.store(0, std::memory_order_relaxed);
                     implicitRead_.store(0, std::memory_order_relaxed);
                     implicitWrite_.store(0, std::memory_order_relaxed);
@@ -1844,7 +1866,7 @@ void LibusbUacDriver::onCapture(libusb_transfer* xfr) {
         return;
     }
     if (xfr->status != LIBUSB_TRANSFER_COMPLETED)
-        captureTransferErrors_.fetch_add(1, std::memory_order_relaxed);
+        capturePacketDrops_.fetch_add(1, std::memory_order_relaxed);
 
     size_t head = captureHead_.load(std::memory_order_relaxed);
     const size_t tail = captureTail_.load(std::memory_order_acquire);
@@ -1859,7 +1881,7 @@ void LibusbUacDriver::onCapture(libusb_transfer* xfr) {
                               pkt.status == LIBUSB_TRANSFER_COMPLETED &&
                               n > 0 && stride > 0;
         if (!packetOk)
-            captureTransferErrors_.fetch_add(1, std::memory_order_relaxed);
+            capturePacketDrops_.fetch_add(1, std::memory_order_relaxed);
         const bool implicit = captureFormat_.implicitFeedback &&
                               format_.feedbackEndpointAddress == 0;
         if (implicit) {
@@ -2068,6 +2090,17 @@ bool LibusbUacDriver::waitForCaptureFrames(int frames, int timeoutMs) const {
     return captureAvailableFrames() >= frames;
 }
 
+bool LibusbUacDriver::waitForCaptureFramesUntil(
+        int frames, std::chrono::steady_clock::time_point deadline) const {
+    if (frames <= 0) return true;
+    while (captureAvailableFrames() < frames &&
+           streaming_.load(std::memory_order_acquire)) {
+        if (!pollWakeFdUntil(captureWakeFd_, deadline)) break;
+        drainWakeFd(captureWakeFd_);
+    }
+    return captureAvailableFrames() >= frames;
+}
+
 
 void LibusbUacDriver::flushRing() {
     // Lockless reset of the SPSC ring. Producer + consumer both
@@ -2135,6 +2168,7 @@ void LibusbUacDriver::stop() {
     captureSequence_.store(0, std::memory_order_relaxed);
     metadataFifoOverruns_.store(0, std::memory_order_relaxed);
     captureUnderruns_.store(0, std::memory_order_relaxed);
+    capturePacketDrops_.store(0, std::memory_order_relaxed);
     LOGI("stopped streaming (full teardown)");
 }
 
@@ -2871,12 +2905,16 @@ void LibusbUacDriver::setUserspaceBufferConfig(
         : 0;
     const int maxTarget = std::max(0, physicalFrames);
     const int automaticTarget = autoConfig.targetFrames;
-    const int target = userConfig.playbackTargetFrames == 0
-        ? std::min(maxTarget, automaticTarget)
-        : userConfig.playbackTargetFrames;
     const int headroom = userConfig.writeHeadroomFrames == 0
         ? autoConfig.graphQuantum
         : userConfig.writeHeadroomFrames;
+    const int requestedTarget = userConfig.playbackTargetFrames == 0
+        ? std::min(maxTarget, automaticTarget)
+        : userConfig.playbackTargetFrames;
+    const int safeTargetFloor = lowLatencyProfile_
+        ? std::min(std::max(0, maxTarget - headroom), autoConfig.graphQuantum * 3)
+        : 0;
+    const int target = std::max(requestedTarget, safeTargetFloor);
     const int automaticPrime = startupPlaybackPrimeFrames(
         maxTarget, exactInitialPacketFrames_, target, headroom);
     const int prime = userConfig.startupPrimeFrames == 0
