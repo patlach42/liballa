@@ -153,6 +153,33 @@ TEST(UsbPacketSchedule, NominalTransferFramesRejectsNonPositiveInputs) {
     }
 }
 
+// A render is allowed only after a whole capture quantum is available;
+// otherwise a partial read would be rendered with a zero-filled tail.
+TEST(UsbCaptureScheduling, RequiresCompleteCaptureQuantum) {
+    struct CaptureCase {
+        int available;
+        int required;
+        bool expected;
+        const char* name;
+    };
+    const CaptureCase cases[] = {
+        {0, 64, false, "no captured frames"},
+        {32, 64, false, "half quantum"},
+        {63, 64, false, "one frame short"},
+        {64, 64, true, "exactly one quantum"},
+        {65, 64, true, "backlog beyond one quantum"},
+        {100, 0, false, "zero required frames"},
+        {100, -1, false, "negative required frames"},
+    };
+
+    for (const auto& test : cases) {
+        SCOPED_TRACE(test.name);
+        EXPECT_EQ(monotrypt::usb::isCompleteCaptureQuantum(
+                      test.available, test.required),
+                  test.expected);
+    }
+}
+
 
 
 

@@ -58,6 +58,14 @@ constexpr int checkedFrameSum(int first, int second) noexcept {
     return first + second;
 }
 
+// A render quantum is admitted only when every capture frame is present.
+// Processing a partial quantum would expose readInputChannels' zero-filled
+// tail as an audible discontinuity.
+constexpr bool isCompleteCaptureQuantum(
+        int availableFrames, int requiredFrames) noexcept {
+    return requiredFrames > 0 && availableFrames >= requiredFrames;
+}
+
 
 constexpr int kDefaultPeriodMultiplier = 3;
 constexpr int kMinPeriodMultiplier = 1;
