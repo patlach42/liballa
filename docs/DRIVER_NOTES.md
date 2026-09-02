@@ -3,21 +3,17 @@
 This package-scoped adaptation preserves the direct USB evidence from the consumer notes. RackGraph, plugin, JNI, Kotlin/UI, and AudioEngine ownership details are intentionally omitted.
 
 
-## Current Audient iD4 MKII profile
+## Historical Audient iD4 MKII evidence
 
 - Device: Audient iD4 MKII (`VID 0x2708`, `PID 0x0009`), UAC2, `48 kHz`,
   24-bit PCM in 32-bit subslots, four capture and four playback channels.
-- Graph quantum: `16` frames. The current Auto policy with period multiplier
-  `3` resolves to a `408`-frame userspace target and a `424`-frame startup
-  prime.
-- USB pump: eight transfers of four high-speed packets. This keeps 32 packets,
-  normally 192 frames or 4 ms, submitted to the kernel while retaining 0.5 ms
-  completion granularity.
-- The latest eight-cycle device run before the packet-layout fix measured
-  9.02–10.21 ms of complete host queue and reported zero host xruns, silence
-  padding, transfer errors, lifecycle failures, and deadline misses. The user
-  still heard periodic silence clicks. This proves that the stress counters
-  were not sufficient to establish end-to-end continuity.
+- Earlier hardware runs established the implicit-feedback packet-layout and
+  lifecycle fixes. Their transfer counts, batching, and queue sizes are
+  calibration evidence only; the runtime driver no longer selects policy by
+  VID/PID.
+- The current automatic policy derives transfer cadence from negotiated
+  endpoint geometry. The application may apply an exact measured profile, and
+  expert controls may request exact values that pass physical-capacity checks.
 - Host queue measurements cover capture → graph → playback queueing. They do
   not include ADC/DAC conversion, analog loopback, or the device's internal
   FIFO.
@@ -115,8 +111,8 @@ implicit-feedback layouts.
 
 Keep:
 
-- Audient-scoped eight-transfer/four-packet profile: 4 ms kernel runway with
-  0.5 ms completion granularity.
+- Endpoint-derived generic transfer geometry; device measurements live in
+  calibration profiles rather than driver branches.
 - Capture-before-OUT metadata priming.
 - Exact rational packet scheduler for non-implicit paths.
 - Per-packet capture-derived layouts for implicit feedback.
@@ -159,7 +155,15 @@ The current contract exposes the latency terms separately:
   quantum. `0` selects the documented automatic headroom.
 - **Capture queue limit**: explicit capture-read limit. `0` selects the derived
   transfer/playback runway policy.
-- **Transfer count** and **packets per transfer**: `0` selects endpoint/profile
+- **Capture target**: exact post-read input runway. `0` selects two negotiated
+  capture-transfer waves, absorbing completion and scheduler jitter without a
+  device-specific quantum floor.
+- **Capture headroom**: physical ring space reserved for an incoming completion
+  wave. `0` resolves to one negotiated capture-transfer wave.
+- **Capture deadline slack**: extra bounded wait allowance, expressed in
+  frames. `0` resolves to one negotiated capture-transfer wave; it does not
+  consume ring capacity.
+- **Transfer count** and **packets per transfer**: `0` selects endpoint-derived
   geometry; positive values are bounded to `1..8` and validated before pump
   allocation. These are transport tuning controls, not guaranteed latency
   improvements.
@@ -168,9 +172,10 @@ The current contract exposes the latency terms separately:
   stopping the USB event/pump threads before replacing callback-visible storage;
   it is a physical storage ceiling, not an automatic latency target.
 
-Invalid combinations fail startup rather than being silently raised. In
-particular, `playback target + write headroom` must fit the selected ring, and
-startup prime must fit the ring and the exact initial USB packet runway.
+Invalid combinations fail startup rather than being silently raised.
+`playback target + write headroom` must fit the playback ring; `graph quantum +
+capture target + capture headroom` must fit the capture ring. Startup prime
+must fit the playback ring and the exact initial USB packet runway.
 
 The thermal safety policy was removed from the default path so explicit queue
 settings remain stable during a session. If reintroduced, it must be an
@@ -235,6 +240,6 @@ end-to-end continuity from aggregate xrun counters alone.
 - CPU affinity and urgent scheduler requests are best-effort. Android/vendor
   policy may ignore or deny them; they are never part of the correctness
   contract.
-- Unknown USB devices retain the conservative generic transfer and watermark
-  policy. Do not apply the Audient profile without device-specific hardware
-  evidence.
+- Every USB device uses the same endpoint-derived automatic policy. Lower
+  exact runways require a measured stable calibration profile or an explicit
+  expert setting; VID/PID never changes runtime scheduling.

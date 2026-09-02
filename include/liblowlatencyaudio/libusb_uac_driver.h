@@ -199,9 +199,13 @@ public:
     void resetRealtimeCounters() noexcept {
         captureOverruns_.store(0, std::memory_order_relaxed);
         captureUnderruns_.store(0, std::memory_order_relaxed);
+        capturePacketDrops_.store(0, std::memory_order_relaxed);
         playbackUnderruns_.store(0, std::memory_order_relaxed);
     }
     int discardCaptureFrames(int maxFrames) noexcept;
+    uint64_t capturePacketDropCount() const noexcept {
+        return capturePacketDrops_.load(std::memory_order_acquire);
+    }
     ImplicitFeedbackStats implicitFeedbackStats() const noexcept {
         const size_t implicitWrite =
             implicitWrite_.load(std::memory_order_acquire);
@@ -273,6 +277,15 @@ public:
     }
     int playbackTargetFrames() const noexcept {
         return playbackTargetFrames_.load(std::memory_order_acquire);
+    }
+    int captureTargetFrames() const noexcept {
+        return captureTargetFrames_.load(std::memory_order_acquire);
+    }
+    int captureHeadroomFrames() const noexcept {
+        return captureHeadroomFrames_.load(std::memory_order_acquire);
+    }
+    int captureDeadlineSlackFrames() const noexcept {
+        return captureDeadlineSlackFrames_.load(std::memory_order_acquire);
     }
     int bufferedFrames() const;
     // Applies all userspace buffering policy before stream start. Positive
@@ -439,21 +452,21 @@ private:
     // actually drained; pads remainder with silence so iso packets
     // ship even on underrun (better a glitch than a dropped URB).
     int drainRing(uint8_t* dst, int bytes);
-
-    // SPSC ring buffer. Power-of-two size, atomic head/tail. Producer
-    // is the audio thread (writePcm); consumer is the event thread
-    // via onIso → drainRing.
+    // SPSC ring buffer. Power-of-two size, atomic head/tail.
     std::vector<uint8_t> ring_;
-    size_t ringMask_ = 0;
-    std::atomic<size_t> ringHead_{0};  // producer cursor (writePcm)
-    std::atomic<size_t> ringTail_{0};  // consumer cursor (onIso)
+    size_t ringMask_ = kPlaybackRingBytes - 1;
     // Frame-based latency budget, configured by the graph quantum.
     std::atomic<int> graphQuantum_{64};
     std::atomic<int> playbackTargetFrames_{128};
     std::atomic<int> startupPrimeFrames_{128};
     std::atomic<int> writeHeadroomFrames_{64};
     std::atomic<int> captureLimitFrames_{0};
+    std::atomic<int> captureTargetFrames_{0};
+    std::atomic<int> captureHeadroomFrames_{0};
+    std::atomic<int> captureDeadlineSlackFrames_{0};
     UserspaceBufferConfig userspaceBufferConfig_{};
+    std::atomic<size_t> ringHead_{0};  // producer cursor (writePcm)
+    std::atomic<size_t> ringTail_{0};  // consumer cursor (onIso)
     std::atomic<uint64_t> queuedOutFrames_{0};
     mutable std::mutex mutex_;          // guards open/start/stop only
     mutable std::recursive_mutex sessionMutex_; // serializes start/duplex/stop
@@ -492,8 +505,8 @@ private:
     std::atomic<int> captureFrameStride_{1};
     std::atomic<bool> captureActive_{false};
     int captureWakeFd_ = -1;
-    std::vector<libusb_transfer*> captureTransfers_;
     std::vector<std::vector<uint8_t>> captureTransferBuffers_;
+    std::vector<libusb_transfer*> captureTransfers_;
     bool captureInterfaceClaimed_ = false;
     uint8_t claimedCaptureIface_ = 0xFF;
     std::atomic<uint64_t> captureOverruns_{0};
@@ -504,7 +517,6 @@ private:
     static constexpr size_t kMaxTransferCount = 8;
     std::array<std::atomic<uint32_t>, kImplicitFifoCapacity> implicitFrames_{};
     std::atomic<size_t> implicitRead_{0};
-    bool lowLatencyProfile_ = false;
     int transferCount_ = 4;
     int playbackPacketsPerTransfer_ = 1;
     int capturePacketsPerTransfer_ = 1;

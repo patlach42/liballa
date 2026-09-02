@@ -8,9 +8,20 @@ The host queue estimate is capture → graph → playback queueing. It excludes 
 
 ## Repeatable calibration
 
-Record device identity, descriptors and clock topology, sample rate, valid bits/subslot bytes, channel count, block size, period multiplier, transfer runway, watermark, cycle count, and Android build/device. Run at least two 30-second cycles per candidate profile, including stop/restart. Require zero capture/playback/aggregate xruns, transfer errors, lifecycle failures, deadline misses, metadata FIFO overruns, and unexplained silence before lowering a watermark. Manual watermark cannot undercut the automatic safety floor.
+Record device identity, descriptors and clock topology, sample rate, valid
+bits/subslot bytes, channel count, graph quantum, period multiplier, transfer
+runway, playback target, capture target/headroom/slack, and Android build/device.
+Use a short ascending scan only to nominate a profile. Certify the selected
+profile with one continuous five-minute run plus repeated stop/start cycles.
+Require zero capture/playback/aggregate xruns, packet or quantum drops, transfer
+errors, lifecycle failures, metadata FIFO overruns, and inserted silence.
+Scheduler pressure is reported separately and must remain inside the measured
+capture/playback runway; it is not itself an audible discontinuity.
 
-For every accepted profile retain raw telemetry and summarize minimum stable buffer, host queue frames/ms, pending-transfer high-water/age, and failure counters. Unknown devices require their own evidence.
+Positive expert targets are exact. Lowering an automatic target therefore
+requires profile-specific device evidence rather than a hidden driver floor.
+Retain raw telemetry and summarize the minimum stable quantum, host queue
+frames/ms, pending-transfer high-water/age, and failure counters.
 
 ## Diagnostics ladder
 
@@ -20,6 +31,15 @@ For a remaining click or discontinuity:
 2. Reproduce with the main/test APK and compare a Linux A/B run.
 3. Inspect usbmon or a hardware USB analyzer for service cadence and payload boundaries.
 4. Use a deterministic impulse and analog loopback to measure actual round-trip latency.
+
+The Direct USB settings **Measure round-trip** action performs that final step.
+With output 1 physically connected to input 1, it temporarily mutes the rack,
+emits a bounded deterministic probe on output 1, captures input 1, and reports
+the normalized-correlation delay in frames and milliseconds. This result is
+full DAC → cable → ADC analog round trip for the active format/profile. Keep it
+separate from the estimated host queue. Correlation and input/output peaks must
+be reported with the latency so a muted, clipped, unplugged, or weak loop cannot
+produce a credible result.
 
 Never infer end-to-end continuity from aggregate xrun counters alone. Test variable packet boundaries byte-for-byte; `_simple` offset assumptions can corrupt payload while statuses remain successful.
 

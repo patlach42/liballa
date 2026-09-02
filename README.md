@@ -63,11 +63,18 @@ The include tree preserves the existing C++ namespaces and API. Only ownership a
 
 The DirectUsbOutput float adapter converts directly into up to two writable/readable ring spans (zero-copy two-span PCM). The old staging vectors are not part of the driver contract.
 
-## Device policy and observed result
+## Device policy and observed results
 
-The Audient iD4 MKII profile is device-scoped (`VID 0x2708`, `PID 0x0009`, UAC2, 48 kHz, 24-bit in 32-bit subslots, four channels). Its eight-transfer/four-packet runway and safety watermark are evidence-backed, not universal defaults. Unknown devices retain conservative generic transfer and watermark policy; do not generalize the Audient profile without packet-layout, clock, and live-cycle evidence.
+Runtime scheduling is device-independent. Automatic transfer geometry comes
+from the negotiated endpoint cadence; automatic userspace playback runway is
+the graph quantum multiplied by the selected period multiplier. Positive
+playback/capture terms are exact calibrated or expert requests and fail startup
+when they do not fit. The driver contains no VID/PID latency floors or transfer
+profiles.
 
-Under the documented Audient configuration (48 kHz, buffer 16, multiplier 3, eight 30-second cycles), observed host queue estimates were **313–346 frames (6.52–7.21 ms)** with zero measured xruns, transfer errors, lifecycle failures, and deadline misses. This is host queue accounting only: it excludes ADC/DAC conversion, device FIFO, analog loopback, and acoustic latency. A Xiaomi live profile also demonstrated a stable 48-frame/multiplier-5 run at an estimated 8.4375 ms host queue; that profile is not a universal promise.
+Audient iD4 MKII and Xiaomi measurements remain useful calibration evidence,
+not runtime policy. Host queue accounting excludes ADC/DAC conversion, device
+FIFO, analog loopback, and acoustic latency.
 
 ## Performance decisions and rejected approaches
 

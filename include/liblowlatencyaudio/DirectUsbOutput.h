@@ -133,6 +133,15 @@ public:
     int playbackTargetFrames() const noexcept {
         return driver_.playbackTargetFrames();
     }
+    int captureTargetFrames() const noexcept {
+        return driver_.captureTargetFrames();
+    }
+    int captureHeadroomFrames() const noexcept {
+        return driver_.captureHeadroomFrames();
+    }
+    int captureDeadlineSlackFrames() const noexcept {
+        return driver_.captureDeadlineSlackFrames();
+    }
 
     void requestStop() noexcept {
         accepting_.store(false, std::memory_order_release);
@@ -289,6 +298,9 @@ public:
     uint64_t captureXRunCount() const noexcept {
         const auto stats = driver_.captureStats();
         return stats.overruns + stats.underruns;
+    }
+    uint64_t capturePacketDropCount() const noexcept {
+        return driver_.capturePacketDropCount();
     }
     monotrypt::usb::CaptureStats captureStats() const noexcept {
         return driver_.captureStats();

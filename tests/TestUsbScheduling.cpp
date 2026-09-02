@@ -236,7 +236,7 @@ TEST(UsbPlaybackWatermark, ExplicitMultiplierControlsTargetAndClampsBounds) {
     EXPECT_EQ(aboveMaximum.targetFrames, 512);
     EXPECT_EQ(aboveMaximum.frameLimit, 576);
 }
-TEST(UsbPlaybackWatermark, ResolvesAutomaticAndManualTargetsWithoutHiddenReserve) {
+TEST(UsbPlaybackWatermark, ResolvesAutomaticAndManualTargetsExactly) {
     struct ResolveCase {
         int automaticTargetFrames;
         int manualTargetFrames;
@@ -251,18 +251,18 @@ TEST(UsbPlaybackWatermark, ResolvesAutomaticAndManualTargetsWithoutHiddenReserve
         {-20, 0, 16, 4096, 0, "automatic target clamps below zero"},
         {5000, -1, 64, 4096, 4096,
          "automatic target clamps to physical maximum"},
-        {512, 144, 16, 4096, 512,
-         "stale calibration below automatic target cannot lower safety floor"},
-        {512, 144, 64, 4096, 512,
-         "stale calibration below automatic target cannot lower safety floor with larger quantum"},
-        {512, 1, 16, 4096, 512,
-         "positive manual target below automatic target keeps automatic floor"},
-        {512, 63, 64, 4096, 512,
-         "manual target below automatic target keeps automatic floor"},
-        {32, 1, 64, 4096, 64,
-         "graph quantum raises a positive manual target below quantum"},
+        {512, 144, 16, 4096, 144,
+         "positive manual target below automatic is retained exactly"},
+        {512, 144, 64, 4096, 144,
+         "positive manual target below graph quantum is retained exactly"},
+        {512, 1, 16, 4096, 1,
+         "small positive manual target is not raised to an automatic floor"},
+        {512, 63, 64, 4096, 63,
+         "manual target below graph quantum remains exact"},
+        {32, 1, 64, 4096, 1,
+         "manual target below graph quantum remains exact"},
         {512, 768, 16, 4096, 768,
-         "manual target above automatic target raises the safety floor"},
+         "manual target above automatic target is retained"},
         {512, 5000, 16, 4096, 4096,
          "manual target clamps down to physical maximum"},
         {512, 4097, 64, 4096, 4096,
@@ -317,6 +317,33 @@ TEST(UsbPlaybackWatermark, EveryWatermarkFitsPhysicalWorstFormatRing) {
         EXPECT_GE(config.frameLimit, config.graphQuantum);
     }
 }
+TEST(UsbBufferPolicy, CheckedFrameBudgetRejectsOverflowAndOutOfBounds) {
+    constexpr int kMax = std::numeric_limits<int>::max();
+    struct BudgetCase {
+        int first;
+        int second;
+        int third;
+        int capacity;
+        bool fits;
+        const char* name;
+    };
+    const BudgetCase cases[] = {
+        {8, 3, 4, 15, true, "exact capacity boundary"},
+        {8, 3, 5, 15, false, "one frame over capacity"},
+        {kMax, 1, 0, kMax, false, "checked sum rejects integer overflow"},
+        {-1, 0, 0, 16, false, "negative first term"},
+        {0, -1, 0, 16, false, "negative second term"},
+        {0, 0, -1, 16, false, "negative third term"},
+    };
+
+    for (const auto& test : cases) {
+        SCOPED_TRACE(test.name);
+        EXPECT_EQ(monotrypt::usb::checkedFrameBudgetFits(
+                      test.first, test.second, test.third, test.capacity),
+                  test.fits);
+    }
+}
+
 TEST(UsbPlaybackWatermark, EffectiveTargetIncludesQueuedTransferFloor) {
     constexpr int kGraphQuantum = 16;
     constexpr int kInitialTransfers = 4;
@@ -357,53 +384,32 @@ TEST(UsbPlaybackWatermark, EffectiveTargetIncludesQueuedTransferFloor) {
                   test.expectedTarget);
     }
 }
-TEST(UsbPlaybackWatermark, ProfileAccountingIncludesOnlyRequiredTransfers) {
-    struct AccountingCase {
-        int inflightTransfers;
-        int reserveTransfers;
-        bool exactInFlightAccounting;
-        int expected;
-        const char* name;
-    };
-    const AccountingCase cases[] = {
-        {4, 3, true, 3,
-         "calibrated iD4 profile excludes already-submitted USB transfers"},
-        {4, 3, false, 7,
-         "generic device includes already-submitted USB transfers"},
-    };
-
-    for (const auto& test : cases) {
-        SCOPED_TRACE(test.name);
-        EXPECT_EQ(monotrypt::usb::playbackWatermarkTransferCount(
-                      test.inflightTransfers, test.reserveTransfers,
-                      test.exactInFlightAccounting),
-                  test.expected);
-    }
+TEST(UsbPlaybackWatermark, GenericTransferAccountingIncludesInflightAndReserve) {
+    EXPECT_EQ(monotrypt::usb::playbackWatermarkTransferCount(4, 3, false), 7);
 }
 
 TEST(UsbPlaybackWatermark, TransferAccountingClampsNegativeCountsToZero) {
     struct ClampCase {
         int inflightTransfers;
         int reserveTransfers;
-        bool exactInFlightAccounting;
         int expected;
         const char* name;
     };
     const ClampCase cases[] = {
-        {0, 0, true, 0, "zero counts"},
-        {-4, 7, true, 7, "negative in-flight count"},
-        {4, -7, false, 4, "negative reserve count"},
-        {-4, -7, false, 0, "both counts negative"},
+        {0, 0, 0, "zero counts"},
+        {-4, 7, 7, "negative in-flight count"},
+        {4, -7, 4, "negative reserve count"},
+        {-4, -7, 0, "both counts negative"},
     };
 
     for (const auto& test : cases) {
         SCOPED_TRACE(test.name);
         EXPECT_EQ(monotrypt::usb::playbackWatermarkTransferCount(
-                      test.inflightTransfers, test.reserveTransfers,
-                      test.exactInFlightAccounting),
+                      test.inflightTransfers, test.reserveTransfers, false),
                   test.expected);
     }
 }
+
 
 TEST(UsbPlaybackWatermark, GenericTransferAccountingSaturatesIntegerOverflow) {
     constexpr int kMax = std::numeric_limits<int>::max();
@@ -537,31 +543,30 @@ TEST(UsbPlaybackRunway, PreservesRepresentableResultAndSaturatesOverflow) {
     EXPECT_EQ(monotrypt::usb::playbackRunwayNanoseconds(kMax, 1), kMax);
 }
 
-TEST(UsbPlaybackPrime, FillsHighWatermarkAndClampsPhysicalCapacity) {
+TEST(UsbPlaybackPrime, FillsTargetOrExactPacketAndClampsCapacity) {
     struct PrimeCase {
         int maxTarget;
         int exactInitialPacketFrames;
         int playbackTargetFrames;
-        int graphQuantum;
         int expectedPrimeFrames;
         const char* name;
     };
     const PrimeCase cases[] = {
-        {2048, 192, 256, 16, 272,
-         "target plus one graph quantum leaves jitter reserve"},
-        {2048, 512, 256, 64, 512,
+        {2048, 192, 256, 256,
+         "automatic prime uses playback target without graph-quantum padding"},
+        {2048, 512, 256, 512,
          "exact initial packet coverage wins when larger"},
-        {2048, 2000, 2040, 64, 2048,
+        {2048, 2000, 4096, 2048,
          "high watermark is clamped to physical capacity"},
-        {100, 1, 90, 16, 100,
-         "small physical ring clamps high-watermark prime"},
+        {100, 1, 90, 90,
+         "target-only prime does not consume graph headroom"},
     };
 
     for (const auto& test : cases) {
         SCOPED_TRACE(test.name);
         EXPECT_EQ(monotrypt::usb::startupPlaybackPrimeFrames(
                       test.maxTarget, test.exactInitialPacketFrames,
-                      test.playbackTargetFrames, test.graphQuantum),
+                      test.playbackTargetFrames),
                   test.expectedPrimeFrames);
     }
 }

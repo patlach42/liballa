@@ -174,6 +174,9 @@ struct UsbDriverTestAccess {
             LibusbUacDriver& d, const std::vector<uint8_t>& bytes) {
         d.captureRing_ = bytes;
     }
+    static void captureTransferFrames(LibusbUacDriver& d, int frames) {
+        d.captureTransferFrames_.store(frames, std::memory_order_release);
+    }
     static void seedCounters(
             LibusbUacDriver& d,
             uint64_t captureOverruns,
@@ -228,9 +231,6 @@ struct UsbDriverTestAccess {
     static bool line6SelectFormat(LibusbUacDriver& d, StreamFormat* p, StreamFormat* c) { return d.line6SelectFormat(p, c); }
     static void fakeDevice(LibusbUacDriver& d) { d.device_ = reinterpret_cast<libusb_device_handle*>(static_cast<uintptr_t>(1)); }
     static void line6Profile(LibusbUacDriver& d, bool enabled) { d.line6Profile_ = enabled; }
-    static void lowLatencyProfile(LibusbUacDriver& d, bool enabled) {
-        d.lowLatencyProfile_ = enabled;
-    }
 };
 
 } // namespace monotrypt::usb
@@ -330,11 +330,11 @@ TEST(UsbDriverRing, WriteAndDrainPreserveWholeFramesAcrossWrap) {
 TEST(UsbDriverRing, WatermarkRejectsPartialFrameAsBackpressureWithoutPlaybackXrun) {
     monotrypt::usb::LibusbUacDriver driver;
     monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
-    driver.setGraphQuantum(16, 2);  // startup high watermark admits 64 of 65
-    std::vector<uint8_t> input(65 * 4, 0xA5);
+    driver.setGraphQuantum(16, 2);  // startup prime 32 + graph quantum = 48
+    std::vector<uint8_t> input(49 * 4, 0xA5);
 
-    EXPECT_EQ(driver.writePcm(input.data(), 65), 64);
-    EXPECT_EQ(driver.bufferedFrames(), 64);
+    EXPECT_EQ(driver.writePcm(input.data(), 49), 48);
+    EXPECT_EQ(driver.bufferedFrames(), 48);
     EXPECT_EQ(driver.writableFrames(), 0);
     EXPECT_EQ(driver.playbackBackpressureCount(), 1u);
     EXPECT_EQ(driver.playbackXRunCount(), 0u);
@@ -406,7 +406,18 @@ TEST(UsbDriverRing, DrainStarvationPadsSilenceAndCountsPlaybackUnderrun) {
     EXPECT_EQ(driver.playbackSilentFrameCount(), silentFrameBaseline + 3 * outputFrames);
 }
 TEST(UsbDriverTelemetry, ResetRealtimeCountersClearsXrunsOnly) {
+    resetMock();
     monotrypt::usb::LibusbUacDriver driver;
+    monotrypt::usb::UsbDriverTestAccess::captureFormat(driver, 1, 2);
+    monotrypt::usb::UsbDriverTestAccess::captureActive(driver, true);
+    monotrypt::usb::UsbDriverTestAccess::captureInflight(driver, 1);
+    std::vector<uint8_t> payload(2, 0);
+    auto* xfr = makeTransfer(payload);
+    ASSERT_NE(xfr, nullptr);
+    xfr->iso_packet_desc[0].status = LIBUSB_TRANSFER_ERROR;
+    monotrypt::usb::UsbDriverTestAccess::onCapture(driver, xfr);
+    ASSERT_EQ(driver.capturePacketDropCount(), 1u);
+
     monotrypt::usb::UsbDriverTestAccess::seedCounters(
         driver, 3, 5, 7, 11, 13, 17);
 
@@ -415,41 +426,43 @@ TEST(UsbDriverTelemetry, ResetRealtimeCountersClearsXrunsOnly) {
     const auto capture = driver.captureStats();
     EXPECT_EQ(capture.overruns, 0u);
     EXPECT_EQ(capture.underruns, 0u);
+    EXPECT_EQ(driver.capturePacketDropCount(), 0u);
     EXPECT_EQ(driver.playbackXRunCount(), 0u);
 
     const auto transfer = driver.implicitFeedbackStats();
     EXPECT_EQ(transfer.captureTransferErrors, 11u);
     EXPECT_EQ(transfer.playbackTransferErrors, 13u);
     EXPECT_EQ(transfer.lifecycleFailures, 17u);
+    libusb_free_transfer(xfr);
 }
 
-TEST(UsbDriverRing, DefaultWatermarkUsesHighWatermarkStartupLimit) {
+TEST(UsbDriverRing, DefaultWatermarkLeavesOneGraphQuantumAfterAutomaticPrime) {
     monotrypt::usb::LibusbUacDriver driver;
     monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
-    driver.setGraphQuantum(16);  // startup prime 64 + graph quantum = 80
+    driver.setGraphQuantum(16);  // target-only startup prime 48 + graph quantum = 64
 
     constexpr int frameStride = 4;
-    std::vector<uint8_t> input(80 * frameStride, 0xA5);
+    std::vector<uint8_t> input(64 * frameStride, 0xA5);
 
-    EXPECT_EQ(driver.writePcm(input.data(), 49), 49);
-    EXPECT_EQ(driver.bufferedFrames(), 49);
-    EXPECT_EQ(driver.writableFrames(), 31);
+    EXPECT_EQ(driver.startupPrimeFrames(), 48);
+    EXPECT_EQ(driver.writableFrames(), 64);
+    EXPECT_EQ(driver.writePcm(input.data(), 48), 48);
+    EXPECT_EQ(driver.bufferedFrames(), 48);
+    EXPECT_EQ(driver.writableFrames(), 16);
     EXPECT_EQ(driver.playbackXRunCount(), 0u);
 
-    EXPECT_EQ(driver.writePcm(input.data() + 49 * frameStride, 31), 31);
-    EXPECT_EQ(driver.bufferedFrames(), 80);
+    EXPECT_EQ(driver.writePcm(input.data() + 48 * frameStride, 16), 16);
+    EXPECT_EQ(driver.bufferedFrames(), 64);
     EXPECT_EQ(driver.writableFrames(), 0);
     EXPECT_EQ(driver.playbackXRunCount(), 0u);
 }
-
-
 TEST(UsbDriverRing, PartialAdmissionReportsWholeFramesAndCallerCanSubmitTail) {
     monotrypt::usb::LibusbUacDriver driver;
     monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
-    driver.setGraphQuantum(16, 2);  // startup high watermark admits 64 of 65
+    driver.setGraphQuantum(16, 2);  // startup prime 32 + graph quantum = 48
 
     constexpr int frameStride = 4;
-    constexpr int requestedFrames = 65;
+    constexpr int requestedFrames = 49;
     std::vector<uint8_t> input(requestedFrames * frameStride);
     for (int frame = 0; frame < requestedFrames; ++frame) {
         for (int byte = 0; byte < frameStride; ++byte) {
@@ -459,7 +472,7 @@ TEST(UsbDriverRing, PartialAdmissionReportsWholeFramesAndCallerCanSubmitTail) {
     }
 
     const int submitted = driver.writePcm(input.data(), requestedFrames);
-    ASSERT_EQ(submitted, 64);
+    ASSERT_EQ(submitted, 48);
     EXPECT_EQ(driver.bufferedFrames(), submitted);
     EXPECT_EQ(driver.writableFrames(), 0);
 
@@ -486,57 +499,133 @@ TEST(UsbDriverRing, PartialAdmissionReportsWholeFramesAndCallerCanSubmitTail) {
               std::vector<uint8_t>(input.begin() + submitted * frameStride,
                                     input.end()));
 }
-TEST(UsbDriverUserspaceBuffer, ExplicitTargetAndHeadroomBoundWritableAdmission) {
+TEST(UsbDriverUserspaceBuffer, CaptureAutoTargetUsesTwoTransferWaves) {
     monotrypt::usb::LibusbUacDriver driver;
     monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
+    monotrypt::usb::UsbDriverTestAccess::captureFormat(driver, 2, 2);
+    monotrypt::usb::UsbDriverTestAccess::captureTransferFrames(driver, 32);
 
     monotrypt::usb::UserspaceBufferConfig config;
-    config.playbackTargetFrames = 8;
-    config.startupPrimeFrames = 8;
-    config.writeHeadroomFrames = 3;
     config.ringCapacityBytes = 4096;
     ASSERT_TRUE(driver.configureUserspaceBuffers(config));
-
-    // The automatic target for a 16-frame graph quantum is 48 frames. An
-    // explicit target remains exact rather than being raised to that floor.
     driver.setUserspaceBufferConfig(16, config);
-    EXPECT_EQ(driver.playbackTargetFrames(), 8);
-    EXPECT_EQ(driver.startupPrimeFrames(), 8);
 
-    monotrypt::usb::UsbDriverTestAccess::playbackStarted(driver, true);
-    std::vector<uint8_t> input(20 * 4, 0xA5);
-    EXPECT_EQ(driver.writePcm(input.data(), 20), 11);
-    EXPECT_EQ(driver.bufferedFrames(), 11);
-    EXPECT_EQ(driver.writableFrames(), 0);
+    // Automatic capture target covers two waves; headroom and deadline
+    // slack each cover one complete capture wave.
+    EXPECT_EQ(driver.captureTargetFrames(), 64);
+    EXPECT_EQ(driver.captureHeadroomFrames(), 32);
+    EXPECT_EQ(driver.captureDeadlineSlackFrames(), 32);
 }
 
-TEST(UsbDriverUserspaceBuffer, AudientProfileRaisesLowTargetOnlyForAudient) {
+
+TEST(UsbDriverUserspaceBuffer, ExplicitTargetAndAutomaticMultiplierAreDistinct) {
+    monotrypt::usb::LibusbUacDriver explicitDriver;
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(explicitDriver, 2, 2);
+
+    monotrypt::usb::UserspaceBufferConfig explicitConfig;
+    explicitConfig.playbackTargetFrames = 8;
+    explicitConfig.startupPrimeFrames = 8;
+    explicitConfig.writeHeadroomFrames = 3;
+    explicitConfig.ringCapacityBytes = 4096;
+    ASSERT_TRUE(explicitDriver.configureUserspaceBuffers(explicitConfig));
+    explicitDriver.setUserspaceBufferConfig(16, explicitConfig);
+
+    EXPECT_EQ(explicitDriver.playbackTargetFrames(), 8);
+    EXPECT_EQ(explicitDriver.startupPrimeFrames(), 8);
+
+    monotrypt::usb::LibusbUacDriver automaticDriver;
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(automaticDriver, 2, 2);
+    monotrypt::usb::UserspaceBufferConfig automaticConfig;
+    automaticConfig.ringCapacityBytes = 4096;
+    ASSERT_TRUE(automaticDriver.configureUserspaceBuffers(automaticConfig));
+    automaticDriver.setUserspaceBufferConfig(16, automaticConfig);
+
+    // Zero selects the generic graph-quantum multiplier policy (16 * 3);
+    // a positive target is an exact request and is not raised to that value.
+    EXPECT_EQ(automaticDriver.playbackTargetFrames(), 48);
+    EXPECT_EQ(automaticDriver.startupPrimeFrames(), 48);
+    EXPECT_NE(explicitDriver.playbackTargetFrames(),
+              automaticDriver.playbackTargetFrames());
+}
+
+TEST(UsbDriverUserspaceBuffer, GenericPolicyDoesNotUseDeviceIdentity) {
     monotrypt::usb::UserspaceBufferConfig config;
     config.playbackTargetFrames = 64;
-    config.ringCapacityBytes = 4096;  // 1024 stereo 16-bit frames.
+    config.ringCapacityBytes = 4096;
 
-    monotrypt::usb::LibusbUacDriver audient;
-    monotrypt::usb::UsbDriverTestAccess::playbackFormat(audient, 2, 2);
-    monotrypt::usb::UsbDriverTestAccess::lowLatencyProfile(audient, true);
-    ASSERT_TRUE(audient.configureUserspaceBuffers(config));
-    audient.setUserspaceBufferConfig(64, config, 1);
+    monotrypt::usb::LibusbUacDriver first;
+    monotrypt::usb::LibusbUacDriver second;
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(first, 2, 2);
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(second, 2, 2);
+    ASSERT_TRUE(first.configureUserspaceBuffers(config));
+    ASSERT_TRUE(second.configureUserspaceBuffers(config));
+    first.setUserspaceBufferConfig(64, config, 1);
+    second.setUserspaceBufferConfig(64, config, 1);
 
-    EXPECT_GE(audient.playbackTargetFrames(), 192);
-    EXPECT_EQ(audient.startupPrimeFrames(), 256);
-    // Startup admission includes the automatic one-quantum headroom.
-    EXPECT_EQ(audient.writableFrames(), 320);
-
-    monotrypt::usb::LibusbUacDriver generic;
-    monotrypt::usb::UsbDriverTestAccess::playbackFormat(generic, 2, 2);
-    ASSERT_TRUE(generic.configureUserspaceBuffers(config));
-    generic.setUserspaceBufferConfig(64, config, 1);
-
-    // Generic devices retain the explicit target rather than inheriting the
-    // Audient-specific three-quantum runway.
-    EXPECT_EQ(generic.playbackTargetFrames(), 64);
-    EXPECT_EQ(generic.startupPrimeFrames(), 128);
-    EXPECT_EQ(generic.writableFrames(), 192);
+    // Identical endpoint/configuration inputs resolve identically; no
+    // vendor identity is an input to the pacing policy.
+    EXPECT_EQ(first.playbackTargetFrames(), 64);
+    EXPECT_EQ(second.playbackTargetFrames(), first.playbackTargetFrames());
+    EXPECT_EQ(second.startupPrimeFrames(), first.startupPrimeFrames());
+    EXPECT_EQ(second.writableFrames(), first.writableFrames());
 }
+
+
+TEST(UsbDriverUserspaceBuffer, CaptureExplicitTermsAreExactAtCapacityBoundary) {
+    monotrypt::usb::LibusbUacDriver driver;
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
+    monotrypt::usb::UsbDriverTestAccess::captureFormat(driver, 2, 2);
+    monotrypt::usb::UsbDriverTestAccess::captureTransferFrames(driver, 32);
+
+    monotrypt::usb::UserspaceBufferConfig config;
+    config.captureTargetFrames = 892;
+    config.captureHeadroomFrames = 100;
+    config.captureDeadlineSlackFrames = 124;
+    config.ringCapacityBytes = 4096;  // 1024 stereo 16-bit frames.
+    ASSERT_TRUE(driver.configureUserspaceBuffers(config));
+    driver.setUserspaceBufferConfig(16, config);
+
+    EXPECT_EQ(driver.captureTargetFrames(), 892);
+    EXPECT_EQ(driver.captureHeadroomFrames(), 100);
+    EXPECT_EQ(driver.captureDeadlineSlackFrames(), 124);
+}
+
+TEST(UsbDriverUserspaceBuffer, CaptureFrameBudgetOverflowRejectsResolvedTerms) {
+    monotrypt::usb::LibusbUacDriver driver;
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
+    monotrypt::usb::UsbDriverTestAccess::captureFormat(driver, 2, 2);
+    monotrypt::usb::UsbDriverTestAccess::captureTransferFrames(driver, 32);
+
+    monotrypt::usb::UserspaceBufferConfig config;
+    config.captureTargetFrames = 900;
+    config.captureHeadroomFrames = 100;
+    config.captureDeadlineSlackFrames = 25;  // 32 + 900 + 100 > 1024.
+    config.ringCapacityBytes = 4096;
+    ASSERT_TRUE(driver.configureUserspaceBuffers(config));
+    driver.setUserspaceBufferConfig(16, config);
+
+    EXPECT_EQ(driver.captureTargetFrames(), 0);
+    EXPECT_EQ(driver.captureHeadroomFrames(), 0);
+    EXPECT_EQ(driver.captureDeadlineSlackFrames(), 0);
+}
+
+
+TEST(UsbDriverUserspaceBuffer, NegativeCaptureTermsAreRejectedBeforeAllocation) {
+    int monotrypt::usb::UserspaceBufferConfig::* fields[] = {
+        &monotrypt::usb::UserspaceBufferConfig::captureTargetFrames,
+        &monotrypt::usb::UserspaceBufferConfig::captureHeadroomFrames,
+        &monotrypt::usb::UserspaceBufferConfig::captureDeadlineSlackFrames,
+    };
+
+    for (const auto field : fields) {
+        monotrypt::usb::LibusbUacDriver driver;
+        monotrypt::usb::UserspaceBufferConfig config;
+        config.ringCapacityBytes = 4096;
+        config.*field = -1;
+        EXPECT_FALSE(driver.configureUserspaceBuffers(config));
+    }
+}
+
 
 TEST(UsbDriverUserspaceBuffer, InvalidTargetAndHeadroomCannotAdmitFrames) {
     monotrypt::usb::LibusbUacDriver driver;
@@ -725,6 +814,7 @@ TEST(UsbDriverCapture, RecoverablePacketStatusDropResubmitsAndKeepsStreaming) {
 
     monotrypt::usb::UsbDriverTestAccess::onCapture(driver, xfr);
 
+    EXPECT_EQ(driver.capturePacketDropCount(), 1u);
     EXPECT_EQ(driver.implicitFeedbackStats().captureTransferErrors, 0u);
     EXPECT_TRUE(driver.isStreaming());
     EXPECT_EQ(usb_driver_mock_submit_calls(), 1);
@@ -732,6 +822,23 @@ TEST(UsbDriverCapture, RecoverablePacketStatusDropResubmitsAndKeepsStreaming) {
     std::vector<uint8_t> out(2);
     ASSERT_EQ(driver.readCapturePcm(out.data(), 1), 1);
     EXPECT_EQ(out, (std::vector<uint8_t>{0x12, 0x34}));
+
+    // A recoverable transfer-level status drops each of its packets exactly
+    // once. It must not be counted as an additional fatal transfer error.
+    const uint64_t dropsBeforeTransferError = driver.capturePacketDropCount();
+    xfr->status = LIBUSB_TRANSFER_ERROR;
+    for (int i = 0; i < xfr->num_iso_packets; ++i)
+        xfr->iso_packet_desc[i].status = LIBUSB_TRANSFER_COMPLETED;
+    monotrypt::usb::UsbDriverTestAccess::captureInflight(driver, 1);
+    monotrypt::usb::UsbDriverTestAccess::onCapture(driver, xfr);
+
+    EXPECT_EQ(driver.capturePacketDropCount(),
+              dropsBeforeTransferError +
+                  static_cast<uint64_t>(xfr->num_iso_packets));
+    EXPECT_EQ(driver.implicitFeedbackStats().captureTransferErrors, 0u);
+    EXPECT_TRUE(driver.isStreaming());
+    EXPECT_EQ(usb_driver_mock_submit_calls(), 2);
+    EXPECT_EQ(driver.captureAvailableFrames(), 0);
     libusb_free_transfer(xfr);
 }
 
@@ -1088,10 +1195,10 @@ TEST(UsbDriverLifecycle, StopWakesBlockedWritableWait) {
     monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
     driver.setGraphQuantum(16, 1);
 
-    // Startup prime is target + graph quantum (32), and the write limit adds
-    // one graph quantum. Fill the resulting 48-frame limit before waiting.
-    std::vector<uint8_t> full(48 * 4, 0x55);
-    ASSERT_EQ(driver.writePcm(full.data(), 48), 48);
+    // Target-only startup prime is 16, and the write limit adds one graph
+    // quantum. Fill the resulting 32-frame limit before waiting.
+    std::vector<uint8_t> full(32 * 4, 0x55);
+    ASSERT_EQ(driver.writePcm(full.data(), 32), 32);
     monotrypt::usb::UsbDriverTestAccess::streaming(driver, true);
 
     std::promise<void> entered;
@@ -1413,6 +1520,26 @@ TEST(DirectUsbOutput, FullRingDropsNewestQuantumWithoutPartialCommit) {
                   driver, after.data(), static_cast<int>(after.size())),
               static_cast<int>(after.size()));
     EXPECT_EQ(after, before);
+}
+
+TEST(DirectUsbOutput, ExposesResolvedCapturePolicy) {
+    guitarrackcraft::DirectUsbOutput output;
+    auto& driver = output.driver_;
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
+    monotrypt::usb::UsbDriverTestAccess::captureFormat(driver, 2, 2);
+    monotrypt::usb::UsbDriverTestAccess::captureTransferFrames(driver, 32);
+
+    monotrypt::usb::UserspaceBufferConfig config;
+    config.captureTargetFrames = 24;
+    config.captureHeadroomFrames = 40;
+    config.captureDeadlineSlackFrames = 48;
+    config.ringCapacityBytes = 4096;
+    ASSERT_TRUE(output.configureUserspaceBuffers(config));
+    output.setUserspaceBufferConfig(16, config);
+
+    EXPECT_EQ(output.captureTargetFrames(), 24);
+    EXPECT_EQ(output.captureHeadroomFrames(), 40);
+    EXPECT_EQ(output.captureDeadlineSlackFrames(), 48);
 }
 
 TEST(DirectUsbOutput, SubMillisecondCaptureDeadlineDoesNotBlock) {
