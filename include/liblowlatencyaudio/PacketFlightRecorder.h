@@ -114,7 +114,27 @@ public:
     // records from the previous one.
     void setEnabled(bool enabled) noexcept {
         if (enabled) reset();
+        frozen_.store(false, std::memory_order_release);
         enabled_.store(enabled, std::memory_order_release);
+    }
+
+    // Freeze the buffer the first time `trigger` is recorded, the way an
+    // aircraft recorder preserves the run-up to an incident.
+    //
+    // Without this the instrument cannot see what it exists to see. Keeping the
+    // newest records is the wrong policy for a rare event: a thirty second run
+    // offers about 143000 events, the buffer holds 4096, and the one refusal
+    // worth explaining is evicted by the steady-state traffic that follows it.
+    // Freezing keeps the refusal as the newest record and every event leading
+    // up to it as context.
+    //
+    // Event::Unknown disables the trigger. Setup-time only.
+    void setFreezeTrigger(Event trigger) noexcept {
+        freezeTrigger_.store(trigger, std::memory_order_release);
+    }
+
+    bool frozen() const noexcept {
+        return frozen_.load(std::memory_order_acquire);
     }
 
     void reset() noexcept {
@@ -123,12 +143,14 @@ public:
             records_[i].event = Event::Unknown;
         }
         nextSequence_.store(0, std::memory_order_release);
+        frozen_.store(false, std::memory_order_release);
     }
 
     // Realtime path. Bounded, allocation-free, lock-free.
     void record(Event event, uint64_t timestampNs, uint32_t a, uint32_t b,
                 uint32_t ringFrames, uint32_t queuedFrames) noexcept {
         if (!enabled_.load(std::memory_order_relaxed)) return;
+        if (frozen_.load(std::memory_order_relaxed)) return;
         const uint64_t sequence =
             nextSequence_.fetch_add(1, std::memory_order_relaxed);
         Record& slot = records_[sequence & mask_];
@@ -142,6 +164,11 @@ public:
         slot.event = event;
         std::atomic_thread_fence(std::memory_order_release);
         slot.sequence = sequence + 1;
+        // Freeze after publishing, so the trigger itself is the newest record.
+        // A concurrent producer may still land one or two records behind it;
+        // that is preferable to a lock on the realtime path.
+        if (event == freezeTrigger_.load(std::memory_order_relaxed))
+            frozen_.store(true, std::memory_order_release);
     }
 
     // Total events offered to the recorder, including those overwritten.
@@ -179,6 +206,8 @@ private:
     size_t mask_ = 0;
     std::atomic<uint64_t> nextSequence_{0};
     std::atomic<bool> enabled_{false};
+    std::atomic<bool> frozen_{false};
+    std::atomic<Event> freezeTrigger_{Event::Unknown};
 };
 
 } // namespace monotrypt::usb

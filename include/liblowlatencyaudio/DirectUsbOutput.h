@@ -326,6 +326,14 @@ public:
     void setFlightRecorderEnabled(bool enabled) noexcept {
         driver_.flightRecorder().setEnabled(enabled);
     }
+    // Freeze the recorder when this event first occurs, preserving its run-up.
+    void setFlightRecorderFreezeTrigger(
+            monotrypt::usb::PacketFlightRecorder::Event trigger) noexcept {
+        driver_.flightRecorder().setFreezeTrigger(trigger);
+    }
+    bool flightRecorderFrozen() const noexcept {
+        return driver_.flightRecorder().frozen();
+    }
     bool flightRecorderEnabled() const noexcept {
         return driver_.flightRecorder().enabled();
     }

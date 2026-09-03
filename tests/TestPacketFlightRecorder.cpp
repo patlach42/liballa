@@ -178,4 +178,53 @@ TEST(PacketFlightRecorder, MonotonicClockIsNonDecreasing) {
     EXPECT_GE(second, first);
 }
 
+// The instrument exists to explain rare events, and a rare event is exactly
+// what a keep-the-newest policy throws away: the first device run offered
+// 143329 events into a 4096 slot buffer, so the single refusal worth
+// explaining was evicted by the steady-state traffic that followed it.
+TEST(PacketFlightRecorder, FreezeTriggerPreservesTheRunUpToTheEvent) {
+    PacketFlightRecorder recorder(8);
+    recorder.setFreezeTrigger(Event::QuantumRefused);
+    recorder.setEnabled(true);
+
+    // Context leading up to the incident.
+    for (uint32_t i = 0; i < 5; ++i)
+        recorder.record(Event::QuantumOffered, i, i, 0, 100 + i, 0);
+    recorder.record(Event::QuantumRefused, 99, 60, 64, 130, 96);
+    EXPECT_TRUE(recorder.frozen());
+
+    // Steady-state traffic that would otherwise evict the incident.
+    for (uint32_t i = 0; i < 100; ++i)
+        recorder.record(Event::PlaybackComplete, 500 + i, i, 0, 50, 0);
+
+    PacketFlightRecorder::Record out[8]{};
+    const size_t count = recorder.snapshot(out, 8);
+    ASSERT_EQ(count, 6u) << "post-trigger traffic must not be recorded";
+    EXPECT_EQ(out[5].event, Event::QuantumRefused)
+        << "the trigger must remain the newest record";
+    EXPECT_EQ(out[5].ringFrames, 130u);
+    for (uint32_t i = 0; i < 5; ++i) {
+        EXPECT_EQ(out[i].event, Event::QuantumOffered)
+            << "context record " << i << " was lost";
+        EXPECT_EQ(out[i].ringFrames, 100u + i);
+    }
+}
+
+TEST(PacketFlightRecorder, FreezeTriggerIsOffByDefaultAndClearedOnEnable) {
+    PacketFlightRecorder recorder(8);
+    recorder.setEnabled(true);
+    recorder.record(Event::QuantumRefused, 1, 1, 1, 1, 1);
+    EXPECT_FALSE(recorder.frozen()) << "no trigger was armed";
+
+    recorder.setFreezeTrigger(Event::QuantumRefused);
+    recorder.record(Event::QuantumRefused, 2, 2, 2, 2, 2);
+    ASSERT_TRUE(recorder.frozen());
+
+    // Re-enabling starts a fresh session, so a frozen buffer must thaw.
+    recorder.setEnabled(true);
+    EXPECT_FALSE(recorder.frozen());
+    recorder.record(Event::PlaybackComplete, 3, 3, 3, 3, 3);
+    EXPECT_EQ(recorder.recorded(), 1u);
+}
+
 } // namespace
