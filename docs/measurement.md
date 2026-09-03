@@ -23,6 +23,22 @@ requires profile-specific device evidence rather than a hidden driver floor.
 Retain raw telemetry and summarize the minimum stable quantum, host queue
 frames/ms, pending-transfer high-water/age, and failure counters.
 
+## Deferred transfers are audible
+
+A deferred OUT transfer is the correct response to missing capture metadata or
+PCM - the driver must never fabricate an implicit layout - but the device still
+loses that service slot, and a listener hears it.
+
+Two four-minute runs of the same profile on an Audient iD4, with a listener
+present: six deferrals plus one admission refusal against eight clicks reported,
+and on the next run two anomalies against one click. Every other counter -
+playback xruns, inserted silence, zero-runway events, capture drops, metadata
+FIFO overruns - stayed at zero throughout, so the aggregate gate passed a
+configuration that was plainly not clean.
+
+Certification therefore requires zero deferral growth alongside the other
+counters. A profile whose only fault is deferrals is not a passing profile.
+
 ## Diagnostics ladder
 
 For a remaining click or discontinuity:
