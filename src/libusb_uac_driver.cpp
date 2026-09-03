@@ -95,50 +95,14 @@ uint64_t monotonicNowNs() noexcept {
             std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 } // namespace
-void signalWakeFd(int fd) noexcept {
-    if (fd < 0) return;
-    eventfd_t one = 1;
-    (void)eventfd_write(fd, one);
-}
-void drainWakeFd(int fd) noexcept {
-    if (fd < 0) return;
-    eventfd_t value = 0;
-    while (eventfd_read(fd, &value) == 0) {}
-}
-bool pollWakeFd(int fd, int timeoutMs) noexcept {
-    if (fd < 0) return false;
-    pollfd pfd{fd, POLLIN, 0};
-    int result;
-    do { result = poll(&pfd, 1, timeoutMs); } while (result < 0 && errno == EINTR);
-    return result > 0;
-}
-bool pollWakeFdUntil(
-        int fd, std::chrono::steady_clock::time_point deadline) noexcept {
-    if (fd < 0) return false;
-    pollfd descriptor{fd, POLLIN, 0};
-    for (;;) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) return false;
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now);
-        timespec timeout{
-            static_cast<time_t>(
-                std::chrono::duration_cast<std::chrono::seconds>(remaining).count()),
-            static_cast<long>(
-                (remaining % std::chrono::seconds(1)).count())
-        };
-        const int result = ppoll(&descriptor, 1, &timeout, nullptr);
-        if (result >= 0) return result > 0;
-        if (errno != EINTR) return false;
-    }
-}
 
 LibusbUacDriver::LibusbUacDriver() {
     ring_.resize(kRingBytes);
     ringMask_ = kRingBytes - 1;
     captureRing_.resize(kCaptureRingBytes);
     captureRingMask_ = kCaptureRingBytes - 1;
-    captureWakeFd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    captureWake_.open();
+    playbackWake_.open();
 }
 LibusbUacDriver::~LibusbUacDriver() {
     stop();
@@ -162,10 +126,8 @@ LibusbUacDriver::~LibusbUacDriver() {
         stop();
         close();
     }
-    if (captureWakeFd_ >= 0) {
-        ::close(captureWakeFd_);
-        captureWakeFd_ = -1;
-    }
+    captureWake_.close();
+    playbackWake_.close();
     std::lock_guard<std::mutex> lock(mutex_);
     if (ctx_) {
         libusb_exit(ctx_);
@@ -1214,7 +1176,7 @@ bool LibusbUacDriver::start(int sampleRateHz, int bitsPerSample, int channels,
         // on this start (or leave empty if the device returns nothing).
         supportedRates_.clear();
     }
-    if (captureWakeFd_ < 0) {
+    if (!captureWake_.valid() || !playbackWake_.valid()) {
         err(StartError::IsoPumpAllocFailed,
             "eventfd creation failed: " + std::string(std::strerror(errno)));
         return false;
@@ -1446,11 +1408,12 @@ bool LibusbUacDriver::line6StartDuplex() {
     const int startupPacketsPerTransfer = packetsPerTransferForRate(startupPacketsPerSecond);
     const size_t required = static_cast<size_t>(transferCount_) * static_cast<size_t>(startupPacketsPerTransfer);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    const WakeChannel::Registration priming(captureWake_);
     while (implicitWrite_.load(std::memory_order_acquire) - implicitRead_.load(std::memory_order_acquire) < required &&
            !stopRequested_.load(std::memory_order_acquire)) {
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
-        if (remaining <= 0 || !pollWakeFd(captureWakeFd_, static_cast<int>(remaining))) break;
-        drainWakeFd(captureWakeFd_);
+        if (remaining <= 0 || !captureWake_.poll(static_cast<int>(remaining))) break;
+        captureWake_.drain();
     }
     if (implicitWrite_.load(std::memory_order_acquire) -
             implicitRead_.load(std::memory_order_acquire) < required)
@@ -1694,13 +1657,14 @@ bool LibusbUacDriver::startDuplex(int sampleRateHz, int bitsPerSample,
             const size_t required = static_cast<size_t>(transferCount_) *
                                     static_cast<size_t>(startupPacketsPerTransfer);
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+            const WakeChannel::Registration priming(captureWake_);
             while (implicitWrite_.load(std::memory_order_acquire) -
                        implicitRead_.load(std::memory_order_acquire) < required &&
                    !stopRequested_.load(std::memory_order_acquire)) {
                 const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                     deadline - std::chrono::steady_clock::now()).count();
-                if (remaining <= 0 || !pollWakeFd(captureWakeFd_, static_cast<int>(remaining))) break;
-                drainWakeFd(captureWakeFd_);
+                if (remaining <= 0 || !captureWake_.poll(static_cast<int>(remaining))) break;
+                captureWake_.drain();
             }
             if (implicitWrite_.load(std::memory_order_acquire) -
                     implicitRead_.load(std::memory_order_acquire) < required) {
@@ -1833,7 +1797,10 @@ void LibusbUacDriver::markTransportFailed() noexcept {
     captureActive_.store(false, std::memory_order_release);
     streaming_.store(false, std::memory_order_release);
     stopRequested_.store(true, std::memory_order_release);
-    signalWakeFd(captureWakeFd_);
+    // Terminal transition: wake both channels unconditionally so no waiter
+    // can miss the failure while the gate below is being observed.
+    captureWake_.signal();
+    playbackWake_.signal();
 }
 
 void LibusbUacDriver::onCapture(libusb_transfer* xfr) {
@@ -1911,7 +1878,7 @@ void LibusbUacDriver::onCapture(libusb_transfer* xfr) {
                                    std::memory_order_release);
 
     submitPendingImplicitTransfers();
-    signalWakeFd(captureWakeFd_);
+    captureWake_.signalIfWaiting();
     if (transportFailed_.load(std::memory_order_acquire)) {
         captureInflight_.fetch_sub(1, std::memory_order_acq_rel);
         return;
@@ -2057,6 +2024,7 @@ int LibusbUacDriver::captureAvailableFrames() const {
 }
 bool LibusbUacDriver::waitForCaptureFrames(int frames, int timeoutMs) const {
     if (frames <= 0) return true;
+    const WakeChannel::Registration waiting(captureWake_);
     const auto deadline = timeoutMs > 0
         ? std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs)
         : std::chrono::steady_clock::time_point::max();
@@ -2069,8 +2037,8 @@ bool LibusbUacDriver::waitForCaptureFrames(int frames, int timeoutMs) const {
             if (remaining <= 0) break;
             waitMs = static_cast<int>(remaining);
         }
-        if (!pollWakeFd(captureWakeFd_, waitMs)) break;
-        drainWakeFd(captureWakeFd_);
+        if (!captureWake_.poll(waitMs)) break;
+        captureWake_.drain();
     }
     return captureAvailableFrames() >= frames;
 }
@@ -2078,10 +2046,11 @@ bool LibusbUacDriver::waitForCaptureFrames(int frames, int timeoutMs) const {
 bool LibusbUacDriver::waitForCaptureFramesUntil(
         int frames, std::chrono::steady_clock::time_point deadline) const {
     if (frames <= 0) return true;
+    const WakeChannel::Registration waiting(captureWake_);
     while (captureAvailableFrames() < frames &&
            streaming_.load(std::memory_order_acquire)) {
-        if (!pollWakeFdUntil(captureWakeFd_, deadline)) break;
-        drainWakeFd(captureWakeFd_);
+        if (!captureWake_.pollUntil(deadline)) break;
+        captureWake_.drain();
     }
     return captureAvailableFrames() >= frames;
 }
@@ -2116,7 +2085,8 @@ void LibusbUacDriver::requestStop() noexcept {
     stopRequested_.store(true, std::memory_order_release);
     captureActive_.store(false, std::memory_order_release);
     streaming_.store(false, std::memory_order_release);
-    signalWakeFd(captureWakeFd_);
+    captureWake_.signal();
+    playbackWake_.signal();
 }
 void LibusbUacDriver::stop() {
     std::lock_guard<std::recursive_mutex> sessionLock(sessionMutex_);
@@ -2689,7 +2659,9 @@ void LibusbUacDriver::onIso(libusb_transfer* xfr) {
             }
         }
     }
-    signalWakeFd(captureWakeFd_);
+    // An OUT completion frees playback ring space; it never changes capture
+    // availability, so it must not wake capture waiters.
+    playbackWake_.signalIfWaiting();
     const int rc = libusb_submit_transfer(xfr);
     if (rc != LIBUSB_SUCCESS) {
         playbackTransferErrors_.fetch_add(1, std::memory_order_relaxed);
@@ -2947,6 +2919,7 @@ int LibusbUacDriver::writableFrames() const {
 
 bool LibusbUacDriver::waitForWritableFrames(int frames, int timeoutMs) const {
     if (frames <= 0) return true;
+    const WakeChannel::Registration waiting(playbackWake_);
     const auto deadline = timeoutMs > 0
         ? std::chrono::steady_clock::now() +
               std::chrono::milliseconds(timeoutMs)
@@ -2962,8 +2935,8 @@ bool LibusbUacDriver::waitForWritableFrames(int frames, int timeoutMs) const {
             if (remaining <= 0) break;
             waitMs = static_cast<int>(remaining);
         }
-        if (!pollWakeFd(captureWakeFd_, waitMs)) break;
-        drainWakeFd(captureWakeFd_);
+        if (!playbackWake_.poll(waitMs)) break;
+        playbackWake_.drain();
     }
     return writableFrames() >= frames;
 }

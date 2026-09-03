@@ -28,6 +28,7 @@
 
 #include <libusb.h>
 #include "UsbScheduling.h"
+#include "WakeChannel.h"
 
 namespace guitarrackcraft {
 class DirectUsbOutput;
@@ -504,7 +505,11 @@ private:
     CaptureFormat captureFormat_{};
     std::atomic<int> captureFrameStride_{1};
     std::atomic<bool> captureActive_{false};
-    int captureWakeFd_ = -1;
+    // Capture availability and playback writability are separate conditions:
+    // an OUT completion never adds capture frames, so sharing one channel woke
+    // every capture waiter on each OUT completion for nothing.
+    WakeChannel captureWake_;
+    WakeChannel playbackWake_;
     std::vector<std::vector<uint8_t>> captureTransferBuffers_;
     std::vector<libusb_transfer*> captureTransfers_;
     bool captureInterfaceClaimed_ = false;
