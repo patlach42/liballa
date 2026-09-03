@@ -82,6 +82,12 @@ public:
         // `a` carries what was available, `b` what was required.
         DeferredNoMetadata = 7,
         DeferredNoPcm = 8,
+        // A step between consecutive output samples larger than any the signal
+        // could legitimately contain. This is what a listener calls a click,
+        // and detecting it here removes the need for anyone to sit through a
+        // four minute tone: `a` is the step scaled by 10000, `b` the frame
+        // within the block, and ringFrames the channel.
+        SignalDiscontinuity = 9,
     };
 
     struct Record {
@@ -153,7 +159,8 @@ public:
                maskOf(Event::PlaybackUnderrun) |
                maskOf(Event::TransferDeferred) |
                maskOf(Event::DeferredNoMetadata) |
-               maskOf(Event::DeferredNoPcm);
+               maskOf(Event::DeferredNoPcm) |
+               maskOf(Event::SignalDiscontinuity);
     }
 
     // Freeze the buffer the first time `trigger` is recorded, the way an

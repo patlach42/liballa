@@ -207,6 +207,7 @@ public:
                 submitted = true;
             }
         }
+        if (submitted) inspectContinuity(left, right, frames);
         activeWriters_.fetch_sub(1, std::memory_order_release);
         if (!submitted) playbackQuantumDrops_.fetch_add(1, std::memory_order_relaxed);
         // Both outcomes are recorded: a refusal alone says only that admission
@@ -326,6 +327,18 @@ public:
     void setFlightRecorderEnabled(bool enabled) noexcept {
         driver_.flightRecorder().setEnabled(enabled);
     }
+    // Flag a step between consecutive output samples larger than this fraction
+    // of full scale. Zero disables the check.
+    //
+    // A click is a discontinuity in the signal, and the signal passes through
+    // here, so it can be detected without a listener sitting through a four
+    // minute tone. A 440 Hz tone at 48 kHz steps by at most 0.058 between
+    // samples; anything far above that is a break.
+    void setDiscontinuityThreshold(float threshold) noexcept {
+        discontinuityThreshold_.store(
+            threshold > 0.0f ? threshold : 0.0f, std::memory_order_release);
+    }
+
     // Record only the selected event types; zero records everything.
     void setFlightRecorderEventMask(uint32_t mask) noexcept {
         driver_.flightRecorder().setEventMask(mask);
@@ -354,6 +367,39 @@ public:
     }
 
 private:
+    // Walks the block once comparing each sample with its predecessor, the
+    // previous block's last sample included, so a break at a block boundary is
+    // caught too. One subtract and compare per sample, and only while the
+    // recorder is armed.
+    void inspectContinuity(const float* left, const float* right,
+                           int frames) noexcept {
+        const float threshold =
+            discontinuityThreshold_.load(std::memory_order_relaxed);
+        if (threshold <= 0.0f || !driver_.flightRecorder().enabled()) return;
+        const float* const channels[2] = {left, right};
+        for (int channel = 0; channel < 2; ++channel) {
+            float previous = lastSample_[channel];
+            for (int frame = 0; frame < frames; ++frame) {
+                const float value = channels[channel][frame];
+                const float step = value > previous ? value - previous
+                                                    : previous - value;
+                if (step > threshold && continuitySeeded_) {
+                    driver_.flightRecorder().record(
+                        monotrypt::usb::PacketFlightRecorder::Event::
+                            SignalDiscontinuity,
+                        monotrypt::usb::monotonicNowNs(),
+                        static_cast<uint32_t>(step * 10000.0f),
+                        static_cast<uint32_t>(frame),
+                        static_cast<uint32_t>(channel),
+                        static_cast<uint32_t>(driver_.queuedOutFrames()));
+                }
+                previous = value;
+            }
+            lastSample_[channel] = previous;
+        }
+        continuitySeeded_ = true;
+    }
+
     template <int Bits, int Bytes>
     static void packPcm(float value, uint8_t* out) noexcept {
         int32_t sample;
@@ -565,6 +611,9 @@ private:
     std::atomic<bool> streaming_{false};
     std::atomic<uint32_t> activeWriters_{0};
     std::atomic<uint64_t> playbackQuantumDrops_{0};
+    std::atomic<float> discontinuityThreshold_{0.0f};
+    float lastSample_[2]{0.0f, 0.0f};
+    bool continuitySeeded_ = false;
 };
 
 } // namespace guitarrackcraft
