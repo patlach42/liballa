@@ -86,7 +86,9 @@ public:
         // could legitimately contain. This is what a listener calls a click,
         // and detecting it here removes the need for anyone to sit through a
         // four minute tone: `a` is the step scaled by 10000, `b` the frame
-        // within the block, and ringFrames the channel.
+        // within the block, ringFrames the channel, and queuedFrames the
+        // frames written since the session began, whose remainder modulo the
+        // loop length says whether the breaks land on clip wraps.
         SignalDiscontinuity = 9,
     };
 

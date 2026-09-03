@@ -391,7 +391,12 @@ private:
                         static_cast<uint32_t>(step * 10000.0f),
                         static_cast<uint32_t>(frame),
                         static_cast<uint32_t>(channel),
-                        static_cast<uint32_t>(driver_.queuedOutFrames()));
+                        // Frames written since the session started. Its
+                        // remainder modulo the loop length says whether the
+                        // breaks land on clip wraps or fall anywhere.
+                        static_cast<uint32_t>(
+                            static_cast<uint64_t>(driver_.writtenFrames()) +
+                            static_cast<uint64_t>(frame)));
                 }
                 previous = value;
             }
