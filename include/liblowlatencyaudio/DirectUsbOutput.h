@@ -321,6 +321,26 @@ public:
         return driver_.eventThreadTid();
     }
 
+    // Diagnostics: step 1 of the ladder in docs/measurement.md. Enable before
+    // start; snapshot from a control thread once production has stopped.
+    void setFlightRecorderEnabled(bool enabled) noexcept {
+        driver_.flightRecorder().setEnabled(enabled);
+    }
+    bool flightRecorderEnabled() const noexcept {
+        return driver_.flightRecorder().enabled();
+    }
+    uint64_t flightRecorderRecorded() const noexcept {
+        return driver_.flightRecorder().recorded();
+    }
+    uint64_t flightRecorderDropped() const noexcept {
+        return driver_.flightRecorder().dropped();
+    }
+    size_t flightRecorderSnapshot(
+            monotrypt::usb::PacketFlightRecorder::Record* out,
+            size_t capacity) const noexcept {
+        return driver_.flightRecorder().snapshot(out, capacity);
+    }
+
 private:
     template <int Bits, int Bytes>
     static void packPcm(float value, uint8_t* out) noexcept {
