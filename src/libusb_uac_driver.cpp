@@ -2879,8 +2879,12 @@ void LibusbUacDriver::setUserspaceBufferConfig(
     const int stride = format_.channels * format_.bytesPerSample;
     const int physicalFrames = stride > 0
         ? static_cast<int>(ring_.size() / static_cast<size_t>(stride)) : 0;
+    // Frames handed to USB per transfer: the granularity the ring drains at.
+    const int drainChunkFrames = transferCount_ > 0
+        ? exactInitialPacketFrames_ / transferCount_ : 0;
     const int headroom = userConfig.writeHeadroomFrames == 0
-        ? autoConfig.graphQuantum : userConfig.writeHeadroomFrames;
+        ? automaticWriteHeadroomFrames(autoConfig.graphQuantum, drainChunkFrames)
+        : userConfig.writeHeadroomFrames;
     const int requestedTarget = userConfig.playbackTargetFrames == 0
         ? autoConfig.targetFrames : userConfig.playbackTargetFrames;
     const int automaticPrime = startupPlaybackPrimeFrames(

@@ -118,6 +118,36 @@ constexpr int playbackWatermarkTransferCount(
         : inflight + reserve;
 }
 
+// Automatic write headroom, derived from how coarsely the ring is drained.
+//
+// Admission requires `writable >= quantum`, that is `occupancy <= target +
+// headroom - quantum`. Between two admissions the consumer normally removes
+// `quantum` frames in `quantum / drainChunk` completions, but the completions
+// are quantised: when only one lands, occupancy climbs by
+// `quantum - drainChunk` in a single step.
+//
+// Measured on an Audient iD4 at 48 kHz with a 64-frame quantum: with four
+// packets per transfer the drain chunk is 24 frames, occupancy before
+// admission ran 81-128 against a threshold of 128, and a cycle that skipped a
+// drain was refused ten frames short. With eight packets the chunk is 48, the
+// same threshold left 91 frames of margin, and no admission was refused.
+// Equating the headroom to the graph quantum ignored the drain granularity,
+// which is what left the narrow geometry with fourteen frames of margin where
+// it needed forty.
+//
+// So the ring must hold the block being admitted plus that worst-case step.
+// A geometry that drains at least a whole quantum per completion keeps the
+// previous behaviour.
+constexpr int automaticWriteHeadroomFrames(int graphQuantum,
+                                           int drainChunkFrames) noexcept {
+    const int quantum = std::max(0, graphQuantum);
+    if (drainChunkFrames <= 0) return quantum;
+    const int step = quantum > drainChunkFrames ? quantum - drainChunkFrames : 0;
+    return quantum > std::numeric_limits<int>::max() - step
+        ? std::numeric_limits<int>::max()
+        : quantum + step;
+}
+
 // Keep the requested number of graph quanta queued before admitting one more.
 inline PlaybackWatermarkConfig playbackWatermarkConfig(
         int requestedFrames, int periodMultiplier = kDefaultPeriodMultiplier) {

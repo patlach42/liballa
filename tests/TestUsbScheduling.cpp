@@ -61,6 +61,35 @@ void expectExactSchedule(uint32_t sampleRate,
     }
 }
 
+// The automatic headroom has to follow the drain granularity, not the graph
+// quantum. Measured on an Audient iD4 at 48 kHz with a 64-frame quantum: four
+// packets per transfer drain 24 frames at a time and left fourteen frames of
+// margin where the missed-drain step needs forty, so a block was refused;
+// eight packets drain 48 and left ninety-one, and nothing was refused.
+TEST(UsbScheduling, AutomaticWriteHeadroomCoversTheMissedDrainStep) {
+    // 4x4 at 48 kHz: chunk 24, step 64 - 24 = 40.
+    EXPECT_EQ(monotrypt::usb::automaticWriteHeadroomFrames(64, 24), 104);
+    // 4x8 at 48 kHz: chunk 48, step 16.
+    EXPECT_EQ(monotrypt::usb::automaticWriteHeadroomFrames(64, 48), 80);
+    // A geometry draining a whole quantum per completion needs no extra room,
+    // which is the behaviour the previous policy had everywhere.
+    EXPECT_EQ(monotrypt::usb::automaticWriteHeadroomFrames(64, 64), 64);
+    EXPECT_EQ(monotrypt::usb::automaticWriteHeadroomFrames(64, 128), 64);
+}
+
+TEST(UsbScheduling, AutomaticWriteHeadroomIsNeverBelowTheGraphQuantum) {
+    // A block still has to fit, so the headroom can never drop under one
+    // quantum however coarse the drain is.
+    for (int chunk = 0; chunk <= 256; ++chunk) {
+        EXPECT_GE(monotrypt::usb::automaticWriteHeadroomFrames(64, chunk), 64)
+            << "drain chunk " << chunk;
+    }
+    // An unknown geometry falls back to the previous policy rather than
+    // inventing headroom from a zero chunk.
+    EXPECT_EQ(monotrypt::usb::automaticWriteHeadroomFrames(128, 0), 128);
+    EXPECT_EQ(monotrypt::usb::automaticWriteHeadroomFrames(0, 24), 0);
+}
+
 } // namespace
 
 TEST(UsbPacketSchedule, SupportedRatesAtHighSpeedUseBoundedCadence) {
