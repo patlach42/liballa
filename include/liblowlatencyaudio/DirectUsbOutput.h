@@ -198,8 +198,8 @@ public:
         }
         activeWriters_.fetch_add(1, std::memory_order_acq_rel);
         bool submitted = false;
-        if (accepting_.load(std::memory_order_acquire) &&
-            driver_.writableFrames() >= frames) {
+        const int writable = driver_.writableFrames();
+        if (accepting_.load(std::memory_order_acquire) && writable >= frames) {
             const auto region = driver_.preparePlaybackWrite(frames);
             if (region.frames == frames &&
                 packPlaybackRegionForFormat(region, left, right)) {
@@ -209,6 +209,20 @@ public:
         }
         activeWriters_.fetch_sub(1, std::memory_order_release);
         if (!submitted) playbackQuantumDrops_.fetch_add(1, std::memory_order_relaxed);
+        // Both outcomes are recorded: a refusal alone says only that admission
+        // failed, while the surrounding accepted blocks give the occupancy
+        // sawtooth the refusal sits on top of. That relationship is what the
+        // headroom policy has to be derived from.
+        auto& recorder = driver_.flightRecorder();
+        recorder.record(
+            submitted
+                ? monotrypt::usb::PacketFlightRecorder::Event::QuantumOffered
+                : monotrypt::usb::PacketFlightRecorder::Event::QuantumRefused,
+            monotrypt::usb::monotonicNowNs(),
+            static_cast<uint32_t>(writable < 0 ? 0 : writable),
+            static_cast<uint32_t>(frames),
+            static_cast<uint32_t>(std::max(0, driver_.bufferedFrames())),
+            static_cast<uint32_t>(driver_.queuedOutFrames()));
         return submitted;
     }
 

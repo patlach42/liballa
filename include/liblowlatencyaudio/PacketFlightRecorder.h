@@ -20,10 +20,20 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 
 namespace monotrypt::usb {
+
+// One clock for every recorder producer, so records from the USB completion
+// path and from the render thread share a timeline.
+inline uint64_t monotonicNowNs() noexcept {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 
 // Fixed-size packet-event flight recorder, step 1 of the diagnostics ladder in
 // docs/measurement.md.

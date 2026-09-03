@@ -89,11 +89,6 @@ void subtractQueued(std::atomic<uint64_t>& value, uint64_t amount) noexcept {
     }
 }
 
-uint64_t monotonicNowNs() noexcept {
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-}
 } // namespace
 
 LibusbUacDriver::LibusbUacDriver() {
@@ -1877,6 +1872,11 @@ void LibusbUacDriver::onCapture(libusb_transfer* xfr) {
         captureSequence_.fetch_add(static_cast<uint64_t>(totalFrames),
                                    std::memory_order_release);
 
+    flightRecorder_.record(
+        PacketFlightRecorder::Event::CaptureComplete, monotonicNowNs(),
+        static_cast<uint32_t>(totalFrames), 0,
+        static_cast<uint32_t>(bufferedFrames()),
+        static_cast<uint32_t>(queuedOutFrames_.load(std::memory_order_relaxed)));
     submitPendingImplicitTransfers();
     captureWake_.signalIfWaiting();
     if (transportFailed_.load(std::memory_order_acquire)) {
@@ -2624,6 +2624,13 @@ void LibusbUacDriver::onIso(libusb_transfer* xfr) {
                 pendingImplicitTransfers_[slot] = xfr;
                 pendingImplicitSinceNs_[slot] = monotonicNowNs();
                 deferredTransfers_.fetch_add(1, std::memory_order_relaxed);
+                flightRecorder_.record(
+                    PacketFlightRecorder::Event::TransferDeferred,
+                    monotonicNowNs(),
+                    static_cast<uint32_t>(pendingImplicitCount_), 0,
+                    static_cast<uint32_t>(bufferedFrames()),
+                    static_cast<uint32_t>(
+                        queuedOutFrames_.load(std::memory_order_relaxed)));
                 pendingDepth_.store(pendingImplicitCount_, std::memory_order_release);
                 uint64_t oldHigh = pendingHighWater_.load(std::memory_order_relaxed);
                 while (pendingImplicitCount_ > oldHigh &&
@@ -2661,6 +2668,14 @@ void LibusbUacDriver::onIso(libusb_transfer* xfr) {
     }
     // An OUT completion frees playback ring space; it never changes capture
     // availability, so it must not wake capture waiters.
+    // Ring occupancy at completion is the sawtooth we need: the drain chunk
+    // size follows the geometry, and its interaction with the fill quantum is
+    // what decides whether admission is refused.
+    flightRecorder_.record(
+        PacketFlightRecorder::Event::PlaybackComplete, monotonicNowNs(),
+        static_cast<uint32_t>(completedFrames), 0,
+        static_cast<uint32_t>(bufferedFrames()),
+        static_cast<uint32_t>(queuedOutFrames_.load(std::memory_order_relaxed)));
     playbackWake_.signalIfWaiting();
     const int rc = libusb_submit_transfer(xfr);
     if (rc != LIBUSB_SUCCESS) {
@@ -2710,6 +2725,16 @@ int LibusbUacDriver::drainRing(uint8_t* dst, int bytes) {
             playbackSilentFrames_.fetch_add(
                 static_cast<uint64_t>((bytes - n) / frameStride),
                 std::memory_order_relaxed);
+            // Recorded per packet, not per episode: the underrun counter above
+            // is edge triggered, so it cannot say how much silence shipped.
+            // Every field is in frames; the local arithmetic here is in bytes.
+            flightRecorder_.record(
+                PacketFlightRecorder::Event::PlaybackUnderrun, monotonicNowNs(),
+                static_cast<uint32_t>(n / frameStride),
+                static_cast<uint32_t>(bytes / frameStride),
+                static_cast<uint32_t>(available / static_cast<size_t>(frameStride)),
+                static_cast<uint32_t>(
+                    queuedOutFrames_.load(std::memory_order_relaxed)));
         }
     } else {
         playbackUnderrunActive_.store(false, std::memory_order_release);

@@ -29,6 +29,7 @@
 #include <libusb.h>
 #include "UsbScheduling.h"
 #include "WakeChannel.h"
+#include "PacketFlightRecorder.h"
 
 namespace guitarrackcraft {
 class DirectUsbOutput;
@@ -241,6 +242,13 @@ public:
             maxPendingAgeNs_.load(std::memory_order_acquire)
         };
     }
+    // Diagnostics: step 1 of the ladder in docs/measurement.md. Enable before
+    // start and snapshot after stop; never toggle while streaming.
+    PacketFlightRecorder& flightRecorder() noexcept { return flightRecorder_; }
+    const PacketFlightRecorder& flightRecorder() const noexcept {
+        return flightRecorder_;
+    }
+
     int32_t eventThreadTid() const noexcept {
         return eventThreadTid_.load(std::memory_order_acquire);
     }
@@ -510,6 +518,8 @@ private:
     // every capture waiter on each OUT completion for nothing.
     WakeChannel captureWake_;
     WakeChannel playbackWake_;
+    // Diagnostics only, disabled by default; see PacketFlightRecorder.
+    PacketFlightRecorder flightRecorder_;
     std::vector<std::vector<uint8_t>> captureTransferBuffers_;
     std::vector<libusb_transfer*> captureTransfers_;
     bool captureInterfaceClaimed_ = false;

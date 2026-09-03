@@ -149,4 +149,33 @@ TEST(PacketFlightRecorder, ConcurrentProducersClaimDistinctSlots) {
         EXPECT_EQ(perProducer[p], static_cast<int>(kPerProducer));
 }
 
+// The realtime paths call record() unconditionally, so a disabled recorder is
+// on the hot path of every USB completion and every render quantum. It must
+// cost an atomic load and nothing else - in particular it must not touch the
+// storage, which would pull a cold line into cache on the audio thread.
+TEST(PacketFlightRecorder, DisabledRecordingLeavesStorageUntouched) {
+    PacketFlightRecorder recorder(8);
+    recorder.setEnabled(true);
+    recorder.record(Event::PlaybackComplete, 11, 22, 33, 44, 55);
+    recorder.setEnabled(false);
+
+    for (int i = 0; i < 1000; ++i)
+        recorder.record(Event::QuantumRefused, 99, 99, 99, 99, 99);
+
+    EXPECT_EQ(recorder.recorded(), 1u) << "disabled recording must not claim slots";
+    PacketFlightRecorder::Record out[8]{};
+    ASSERT_EQ(recorder.snapshot(out, 8), 1u);
+    EXPECT_EQ(out[0].timestampNs, 11u) << "the retained record was overwritten";
+    EXPECT_EQ(out[0].a, 22u);
+}
+
+// Records carry a shared timeline so events from the USB completion path and
+// the render thread can be interleaved during analysis.
+TEST(PacketFlightRecorder, MonotonicClockIsNonDecreasing) {
+    const uint64_t first = monotrypt::usb::monotonicNowNs();
+    const uint64_t second = monotrypt::usb::monotonicNowNs();
+    EXPECT_GT(first, 0u);
+    EXPECT_GE(second, first);
+}
+
 } // namespace
