@@ -102,6 +102,10 @@ def _stable_pass(record):
     peak_cycle = number(record, "peak_cycle_ns")
     if budget is None or budget <= 0 or last_cycle is None or last_cycle <= 0 or host_frames is None or host_frames <= 0 or peak_cycle is None or peak_cycle < last_cycle:
         return False
+    # The certification contract in docs/measurement.md requires zero quantum
+    # drops as well as zero xruns, so the aggregate gate stays strict here.
+    # The split lives in the reported reason and in the backpressure
+    # diagnostic below, which is what ranking configurations needs.
     if _int(record, "actual_xrun_growth", "xrun_growth") != 0:
         return False
     if _max_int(record, "capture_transfer_errors", "playback_transfer_errors", "transfer_errors") != 0:
@@ -214,6 +218,12 @@ def analyze(records, required, parse_diagnostics=None, audit_summaries=None):
         any(v < AGGREGATE_XRUN_REDEFINED_AT_SCHEMA for v in schemas) and
         any(v >= AGGREGATE_XRUN_REDEFINED_AT_SCHEMA for v in schemas))
     diagnostics = list(parse_diagnostics or []) + summary_errors + list(failures)
+    backpressure = sum(_int(r, "quantum_drop_growth") for r in records
+                       if r.get("quantum_drop_growth") is not None)
+    if backpressure:
+        diagnostics.append(
+            "producer_backpressure quantum_drop_growth=%d: the render block was "
+            "refused at the playback watermark; not a starvation event" % backpressure)
     if mixed_aggregate_semantics:
         diagnostics.append(
             "mixed_aggregate_xrun_semantics schemas=%s: aggregate xruns were "
