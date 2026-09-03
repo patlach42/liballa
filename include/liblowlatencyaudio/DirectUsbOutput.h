@@ -201,17 +201,10 @@ public:
         if (accepting_.load(std::memory_order_acquire) &&
             driver_.writableFrames() >= frames) {
             const auto region = driver_.preparePlaybackWrite(frames);
-            if (region.frames == frames) {
-                switch (formatBits_) {
-                    case 16: packPlaybackRegion<16>(region, left, right); break;
-                    case 24: packPlaybackRegion<24>(region, left, right); break;
-                    case 32: packPlaybackRegion<32>(region, left, right); break;
-                    default: break;
-                }
-                if (formatBits_ == 16 || formatBits_ == 24 || formatBits_ == 32) {
-                    driver_.commitPlaybackWrite(region);
-                    submitted = true;
-                }
+            if (region.frames == frames &&
+                packPlaybackRegionForFormat(region, left, right)) {
+                driver_.commitPlaybackWrite(region);
+                submitted = true;
             }
         }
         activeWriters_.fetch_sub(1, std::memory_order_release);
@@ -315,8 +308,8 @@ public:
     }
 
 private:
-    template <int Bits>
-    void packPcm(float value, uint8_t* out) const noexcept {
+    template <int Bits, int Bytes>
+    static void packPcm(float value, uint8_t* out) noexcept {
         int32_t sample;
         if constexpr (Bits == 16) {
             sample = value >= 1.0f ? 32767 : value <= -1.0f ? -32768
@@ -330,43 +323,94 @@ private:
                 : static_cast<int32_t>(value * 2147483647.0f);
         }
         constexpr int validBytes = (Bits + 7) / 8;
-        const int shift = 8 * (formatBytes_ - validBytes);
+        static_assert(Bytes >= validBytes && Bytes <= kMaxSubslotBytes,
+                      "subslot must hold every valid sample byte");
+        constexpr int shift = 8 * (Bytes - validBytes);
         const uint32_t subslot = static_cast<uint32_t>(sample) << shift;
-        for (int byte = 0; byte < formatBytes_; ++byte) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        // Identical bytes to the loop below on a little-endian target, but as
+        // one store instead of four. USB subslots are little-endian by spec.
+        if constexpr (Bytes == 4) {
+            std::memcpy(out, &subslot, sizeof(subslot));
+            return;
+        }
+#endif
+        for (int byte = 0; byte < Bytes; ++byte) {
             out[byte] = static_cast<uint8_t>(subslot >> (8 * byte));
         }
     }
 
-    template <int Bits>
+    template <int Bits, int Bytes>
     void packStereoRun(
             uint8_t* destination, int frames,
             const float* left, const float* right) const noexcept {
         if (frames <= 0) return;
-        const int frameStride = deviceChannels_ * formatBytes_;
+        const int frameStride = deviceChannels_ * Bytes;
         if (deviceChannels_ != kChannels) {
             std::memset(
                 destination, 0,
                 static_cast<size_t>(frames) * frameStride);
         }
         const size_t leftOffset =
-            static_cast<size_t>(outputPair_ * 2) * formatBytes_;
-        const size_t rightOffset = leftOffset + formatBytes_;
+            static_cast<size_t>(outputPair_ * 2) * Bytes;
+        const size_t rightOffset = leftOffset + Bytes;
         for (int frame = 0; frame < frames; ++frame) {
             uint8_t* output =
                 destination + static_cast<size_t>(frame) * frameStride;
-            packPcm<Bits>(left[frame], output + leftOffset);
-            packPcm<Bits>(right[frame], output + rightOffset);
+            packPcm<Bits, Bytes>(left[frame], output + leftOffset);
+            packPcm<Bits, Bytes>(right[frame], output + rightOffset);
+        }
+    }
+
+    // Resolve the session-fixed subslot width once per quantum so the packed
+    // store width is a compile-time constant instead of a per-sample loop bound.
+    bool packPlaybackRegionForFormat(
+            const monotrypt::usb::LibusbUacDriver::PlaybackWriteRegion& region,
+            const float* left, const float* right) const noexcept {
+        switch (formatBits_) {
+            case 16: return packPlaybackRegionForBits<16>(region, left, right);
+            case 24: return packPlaybackRegionForBits<24>(region, left, right);
+            case 32: return packPlaybackRegionForBits<32>(region, left, right);
+            default: return false;
         }
     }
 
     template <int Bits>
+    bool packPlaybackRegionForBits(
+            const monotrypt::usb::LibusbUacDriver::PlaybackWriteRegion& region,
+            const float* left, const float* right) const noexcept {
+        constexpr int validBytes = (Bits + 7) / 8;
+        switch (formatBytes_) {
+            case 2:
+                if constexpr (validBytes <= 2) {
+                    packPlaybackRegion<Bits, 2>(region, left, right);
+                    return true;
+                } else {
+                    return false;
+                }
+            case 3:
+                if constexpr (validBytes <= 3) {
+                    packPlaybackRegion<Bits, 3>(region, left, right);
+                    return true;
+                } else {
+                    return false;
+                }
+            case 4:
+                packPlaybackRegion<Bits, 4>(region, left, right);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    template <int Bits, int Bytes>
     void packPlaybackRegion(
             const monotrypt::usb::LibusbUacDriver::PlaybackWriteRegion& region,
             const float* left, const float* right) const noexcept {
         const size_t stride = static_cast<size_t>(region.frameStride);
         const int firstFrames =
             static_cast<int>(region.firstBytes / stride);
-        packStereoRun<Bits>(region.first, firstFrames, left, right);
+        packStereoRun<Bits, Bytes>(region.first, firstFrames, left, right);
 
         int sourceFrame = firstFrames;
         size_t secondOffset = 0;
@@ -374,7 +418,7 @@ private:
             region.firstBytes - static_cast<size_t>(firstFrames) * stride;
         if (splitBytes > 0) {
             uint8_t splitFrame[kMaxDeviceChannels * kMaxSubslotBytes]{};
-            packStereoRun<Bits>(
+            packStereoRun<Bits, Bytes>(
                 splitFrame, 1, left + sourceFrame, right + sourceFrame);
             std::memcpy(
                 region.first + static_cast<size_t>(firstFrames) * stride,
@@ -386,7 +430,7 @@ private:
         }
         const int remaining = region.frames - sourceFrame;
         if (remaining > 0) {
-            packStereoRun<Bits>(
+            packStereoRun<Bits, Bytes>(
                 region.second + secondOffset, remaining,
                 left + sourceFrame, right + sourceFrame);
         }
