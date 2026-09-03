@@ -227,4 +227,57 @@ TEST(PacketFlightRecorder, FreezeTriggerIsOffByDefaultAndClearedOnEnable) {
     EXPECT_EQ(recorder.recorded(), 1u);
 }
 
+// A 240 second run offers 186675 events into a 4096 slot buffer, nearly all of
+// them routine completions, so the handful of anomalies a listener actually
+// heard cannot all be present at once. Filtering keeps a whole run of them.
+TEST(PacketFlightRecorder, EventMaskKeepsOnlyTheSelectedTypes) {
+    PacketFlightRecorder recorder(64);
+    recorder.setEventMask(PacketFlightRecorder::anomalyMask());
+    recorder.setEnabled(true);
+
+    for (uint32_t i = 0; i < 1000; ++i) {
+        recorder.record(Event::PlaybackComplete, i, i, 0, 50, 0);
+        recorder.record(Event::CaptureComplete, i, i, 0, 50, 0);
+        recorder.record(Event::QuantumOffered, i, i, 64, 50, 0);
+    }
+    EXPECT_EQ(recorder.recorded(), 0u) << "routine traffic must not claim slots";
+
+    recorder.record(Event::TransferDeferred, 1, 2, 0, 60, 96);
+    recorder.record(Event::PlaybackUnderrun, 3, 4, 64, 0, 0);
+    recorder.record(Event::QuantumRefused, 5, 6, 64, 180, 96);
+    EXPECT_EQ(recorder.recorded(), 3u);
+
+    PacketFlightRecorder::Record out[8]{};
+    ASSERT_EQ(recorder.snapshot(out, 8), 3u);
+    EXPECT_EQ(out[0].event, Event::TransferDeferred);
+    EXPECT_EQ(out[1].event, Event::PlaybackUnderrun);
+    EXPECT_EQ(out[2].event, Event::QuantumRefused);
+}
+
+TEST(PacketFlightRecorder, ZeroMaskRecordsEveryEventType) {
+    PacketFlightRecorder recorder(64);
+    recorder.setEventMask(0);
+    recorder.setEnabled(true);
+    recorder.record(Event::PlaybackComplete, 1, 1, 0, 0, 0);
+    recorder.record(Event::QuantumRefused, 2, 2, 0, 0, 0);
+    EXPECT_EQ(recorder.recorded(), 2u);
+}
+
+// The mask is configuration, so a new session must not silently start
+// recording everything again.
+TEST(PacketFlightRecorder, EventMaskSurvivesReEnabling) {
+    PacketFlightRecorder recorder(64);
+    recorder.setEventMask(PacketFlightRecorder::maskOf(Event::QuantumRefused));
+    recorder.setEnabled(true);
+    recorder.record(Event::PlaybackComplete, 1, 1, 0, 0, 0);
+    ASSERT_EQ(recorder.recorded(), 0u);
+
+    recorder.setEnabled(false);
+    recorder.setEnabled(true);
+    recorder.record(Event::PlaybackComplete, 2, 2, 0, 0, 0);
+    EXPECT_EQ(recorder.recorded(), 0u) << "the mask was lost on re-enable";
+    recorder.record(Event::QuantumRefused, 3, 3, 0, 0, 0);
+    EXPECT_EQ(recorder.recorded(), 1u);
+}
+
 } // namespace

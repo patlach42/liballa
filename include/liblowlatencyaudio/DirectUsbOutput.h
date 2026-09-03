@@ -326,6 +326,10 @@ public:
     void setFlightRecorderEnabled(bool enabled) noexcept {
         driver_.flightRecorder().setEnabled(enabled);
     }
+    // Record only the selected event types; zero records everything.
+    void setFlightRecorderEventMask(uint32_t mask) noexcept {
+        driver_.flightRecorder().setEventMask(mask);
+    }
     // Freeze the recorder when this event first occurs, preserving its run-up.
     void setFlightRecorderFreezeTrigger(
             monotrypt::usb::PacketFlightRecorder::Event trigger) noexcept {

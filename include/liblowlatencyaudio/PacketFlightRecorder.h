@@ -112,10 +112,39 @@ public:
 
     // Setup-time only. Enabling clears the history so a session never inherits
     // records from the previous one.
+    // The event mask and freeze trigger are configuration, not history, so
+    // they survive this; only the records and the frozen state are cleared.
     void setEnabled(bool enabled) noexcept {
         if (enabled) reset();
         frozen_.store(false, std::memory_order_release);
         enabled_.store(enabled, std::memory_order_release);
+    }
+
+    // Record only these event types. The mask is a bitfield of
+    // `1 << static_cast<uint16_t>(Event)`; zero records everything.
+    //
+    // Without a filter the anomalies drown. A 240 second run offers 186675
+    // events into a 4096 slot buffer, almost all of them routine completions,
+    // so the five deferred transfers and the one refusal that a listener
+    // actually heard cannot all be present at once. Recording only the
+    // anomalous types keeps a whole run's worth of them, with timestamps that
+    // can be matched against when a click was heard.
+    //
+    // Setup-time only.
+    void setEventMask(uint32_t mask) noexcept {
+        eventMask_.store(mask, std::memory_order_release);
+    }
+
+    static constexpr uint32_t maskOf(Event event) noexcept {
+        return uint32_t{1} << static_cast<uint16_t>(event);
+    }
+
+    // The events that indicate something went wrong, as opposed to the
+    // steady-state traffic that surrounds them.
+    static constexpr uint32_t anomalyMask() noexcept {
+        return maskOf(Event::QuantumRefused) |
+               maskOf(Event::PlaybackUnderrun) |
+               maskOf(Event::TransferDeferred);
     }
 
     // Freeze the buffer the first time `trigger` is recorded, the way an
@@ -151,6 +180,8 @@ public:
                 uint32_t ringFrames, uint32_t queuedFrames) noexcept {
         if (!enabled_.load(std::memory_order_relaxed)) return;
         if (frozen_.load(std::memory_order_relaxed)) return;
+        const uint32_t mask = eventMask_.load(std::memory_order_relaxed);
+        if (mask != 0 && (mask & maskOf(event)) == 0) return;
         const uint64_t sequence =
             nextSequence_.fetch_add(1, std::memory_order_relaxed);
         Record& slot = records_[sequence & mask_];
@@ -208,6 +239,7 @@ private:
     std::atomic<bool> enabled_{false};
     std::atomic<bool> frozen_{false};
     std::atomic<Event> freezeTrigger_{Event::Unknown};
+    std::atomic<uint32_t> eventMask_{0};
 };
 
 } // namespace monotrypt::usb
