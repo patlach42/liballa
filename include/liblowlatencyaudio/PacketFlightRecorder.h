@@ -90,6 +90,23 @@ public:
         // frames written since the session began, whose remainder modulo the
         // loop length says whether the breaks land on clip wraps.
         SignalDiscontinuity = 9,
+        // The same check applied to the packed PCM on its way into a transfer
+        // buffer, which brackets everything between admission and the wire:
+        // the float-to-subslot packing and the two-span ring. A break that
+        // shows here but not at admission was introduced by that stretch; one
+        // that shows at neither is downstream of the driver entirely.
+        TransferDiscontinuity = 10,
+        // The same check on captured input. With a physical loopback from
+        // output one to input one this sees the signal after the DAC, the
+        // cable and the ADC, so a break that appears here while both playback
+        // checks stay clean happened in the device or on the wire, which is
+        // the one stretch the other two cannot reach.
+        //
+        // The threshold is relative to the signal's own decaying peak, so it
+        // does not depend on input gain: `a` is the step scaled by 10000
+        // relative to that peak, `b` the frame, ringFrames the peak itself
+        // scaled by 10000.
+        CaptureDiscontinuity = 11,
     };
 
     struct Record {
@@ -162,7 +179,9 @@ public:
                maskOf(Event::TransferDeferred) |
                maskOf(Event::DeferredNoMetadata) |
                maskOf(Event::DeferredNoPcm) |
-               maskOf(Event::SignalDiscontinuity);
+               maskOf(Event::SignalDiscontinuity) |
+               maskOf(Event::TransferDiscontinuity) |
+               maskOf(Event::CaptureDiscontinuity);
     }
 
     // Freeze the buffer the first time `trigger` is recorded, the way an

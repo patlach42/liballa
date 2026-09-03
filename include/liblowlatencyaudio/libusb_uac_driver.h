@@ -244,6 +244,10 @@ public:
     }
     // Diagnostics: step 1 of the ladder in docs/measurement.md. Enable before
     // start and snapshot after stop; never toggle while streaming.
+    void setTransferDiscontinuityThreshold(float threshold) noexcept {
+        transferDiscontinuityThreshold_.store(
+            threshold > 0.0f ? threshold : 0.0f, std::memory_order_release);
+    }
     PacketFlightRecorder& flightRecorder() noexcept { return flightRecorder_; }
     const PacketFlightRecorder& flightRecorder() const noexcept {
         return flightRecorder_;
@@ -461,6 +465,7 @@ private:
     // actually drained; pads remainder with silence so iso packets
     // ship even on underrun (better a glitch than a dropped URB).
     int drainRing(uint8_t* dst, int bytes);
+    void inspectTransferContinuity(const uint8_t* data, int bytes) noexcept;
     // SPSC ring buffer. Power-of-two size, atomic head/tail.
     std::vector<uint8_t> ring_;
     size_t ringMask_ = kPlaybackRingBytes - 1;
@@ -520,6 +525,12 @@ private:
     WakeChannel playbackWake_;
     // Diagnostics only, disabled by default; see PacketFlightRecorder.
     PacketFlightRecorder flightRecorder_;
+    // Continuity of the packed PCM leaving the ring, in normalised units.
+    // Zero disables the check; state persists across packets so a break at a
+    // packet boundary is caught.
+    std::atomic<float> transferDiscontinuityThreshold_{0.0f};
+    int32_t lastTransferSample_ = 0;
+    bool transferContinuitySeeded_ = false;
     std::vector<std::vector<uint8_t>> captureTransferBuffers_;
     std::vector<libusb_transfer*> captureTransfers_;
     bool captureInterfaceClaimed_ = false;

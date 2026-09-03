@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstring>
 #include <chrono>
+#include <cmath>
 #include <utility>
 #include <cerrno>
 #include <poll.h>
@@ -2717,6 +2718,40 @@ void LibusbUacDriver::onIso(libusb_transfer* xfr) {
 
 // --- Ring buffer ------------------------------------------------------
 
+// Continuity of what actually leaves for the wire. The check at admission sees
+// the float block; this sees the packed subslots after the two-span ring copy,
+// so between them they bracket the packing and the ring.
+void LibusbUacDriver::inspectTransferContinuity(
+        const uint8_t* data, int bytes) noexcept {
+    const float threshold =
+        transferDiscontinuityThreshold_.load(std::memory_order_relaxed);
+    if (threshold <= 0.0f || !flightRecorder_.enabled() || !data) return;
+    const int stride = format_.channels * format_.bytesPerSample;
+    if (stride <= 0 || format_.bytesPerSample != 4) return;
+    constexpr float kScale = 2147483648.0f;
+    for (int offset = 0; offset + stride <= bytes; offset += stride) {
+        int32_t value = 0;
+        std::memcpy(&value, data + offset, sizeof(value));
+        if (transferContinuitySeeded_) {
+            const float step =
+                std::fabs(static_cast<float>(value) -
+                          static_cast<float>(lastTransferSample_)) / kScale;
+            if (step > threshold) {
+                flightRecorder_.record(
+                    PacketFlightRecorder::Event::TransferDiscontinuity,
+                    monotonicNowNs(),
+                    static_cast<uint32_t>(step * 10000.0f),
+                    static_cast<uint32_t>(offset / stride),
+                    0,
+                    static_cast<uint32_t>(playedFrames_.load(
+                        std::memory_order_relaxed)));
+            }
+        }
+        lastTransferSample_ = value;
+        transferContinuitySeeded_ = true;
+    }
+}
+
 int LibusbUacDriver::drainRing(uint8_t* dst, int bytes) {
     size_t head = ringHead_.load(std::memory_order_acquire);
     size_t tail = ringTail_.load(std::memory_order_relaxed);
@@ -2759,6 +2794,7 @@ int LibusbUacDriver::drainRing(uint8_t* dst, int bytes) {
     } else {
         playbackUnderrunActive_.store(false, std::memory_order_release);
     }
+    inspectTransferContinuity(dst, bytes);
     // Frames "played" = frames the pump has dispatched, including the
     // silence padding (since the device hears those samples too). Used
     // for accurate position reporting back to ExoPlayer.

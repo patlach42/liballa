@@ -260,6 +260,7 @@ public:
             }
         }
         driver_.commitCaptureRead(region);
+        if (decodeChannels > 0) inspectCapture(destinations[0], decodedFrames);
         return decodedFrames;
     }
 
@@ -339,6 +340,20 @@ public:
             threshold > 0.0f ? threshold : 0.0f, std::memory_order_release);
     }
 
+    // The same check on captured input, as a fraction of the signal's own
+    // decaying peak so it is independent of input gain. With a loopback from
+    // output one to input one this covers the DAC, the cable and the ADC.
+    void setCaptureDiscontinuityThreshold(float threshold) noexcept {
+        captureDiscontinuityThreshold_.store(
+            threshold > 0.0f ? threshold : 0.0f, std::memory_order_release);
+    }
+
+    // The same check on the packed PCM leaving the ring, which together with
+    // the one above brackets the packing and the two-span ring copy.
+    void setTransferDiscontinuityThreshold(float threshold) noexcept {
+        driver_.setTransferDiscontinuityThreshold(threshold);
+    }
+
     // Record only the selected event types; zero records everything.
     void setFlightRecorderEventMask(uint32_t mask) noexcept {
         driver_.flightRecorder().setEventMask(mask);
@@ -367,6 +382,46 @@ public:
     }
 
 private:
+    // Relative to a decaying peak rather than to full scale: the loopback level
+    // depends on the device's output and input gain, which the driver does not
+    // know. A 440 Hz tone steps by 5.8% of its own peak between samples, so a
+    // threshold several times that is unambiguous at any gain.
+    void inspectCapture(const float* samples, int frames) noexcept {
+        const float threshold =
+            captureDiscontinuityThreshold_.load(std::memory_order_relaxed);
+        if (threshold <= 0.0f || !samples || frames <= 0 ||
+            !driver_.flightRecorder().enabled()) {
+            return;
+        }
+        for (int frame = 0; frame < frames; ++frame) {
+            const float value = samples[frame];
+            const float magnitude = value < 0.0f ? -value : value;
+            if (magnitude > capturePeak_) capturePeak_ = magnitude;
+            // About a second of decay at 48 kHz, so the reference tracks a
+            // level change without following a single break.
+            capturePeak_ *= 0.99998f;
+            const float step = value > capturePrevious_
+                ? value - capturePrevious_ : capturePrevious_ - value;
+            // Ignore anything below a usable level. A relative step is
+            // meaningless while the envelope is still climbing: the first run
+            // reported three breaks during the quarter second of ramp-up, at
+            // peaks of 0.002 to 0.015, and none of them were real.
+            if (captureSeeded_ && capturePeak_ > 0.02f &&
+                step > threshold * capturePeak_) {
+                driver_.flightRecorder().record(
+                    monotrypt::usb::PacketFlightRecorder::Event::
+                        CaptureDiscontinuity,
+                    monotrypt::usb::monotonicNowNs(),
+                    static_cast<uint32_t>(step / capturePeak_ * 10000.0f),
+                    static_cast<uint32_t>(frame),
+                    static_cast<uint32_t>(capturePeak_ * 10000.0f),
+                    static_cast<uint32_t>(driver_.writtenFrames()));
+            }
+            capturePrevious_ = value;
+            captureSeeded_ = true;
+        }
+    }
+
     // Walks the block once comparing each sample with its predecessor, the
     // previous block's last sample included, so a break at a block boundary is
     // caught too. One subtract and compare per sample, and only while the
@@ -617,6 +672,10 @@ private:
     std::atomic<uint32_t> activeWriters_{0};
     std::atomic<uint64_t> playbackQuantumDrops_{0};
     std::atomic<float> discontinuityThreshold_{0.0f};
+    std::atomic<float> captureDiscontinuityThreshold_{0.0f};
+    float capturePrevious_ = 0.0f;
+    float capturePeak_ = 0.0f;
+    bool captureSeeded_ = false;
     float lastSample_[2]{0.0f, 0.0f};
     bool continuitySeeded_ = false;
 };
