@@ -21,6 +21,16 @@ endif()
 include(GoogleTest)
 enable_testing()
 
+add_executable(packet_flight_recorder_tests TestPacketFlightRecorder.cpp)
+target_compile_features(packet_flight_recorder_tests PRIVATE cxx_std_17)
+target_link_libraries(packet_flight_recorder_tests PRIVATE
+    lowlatencyaudio::lowlatencyaudio
+    GTest::gtest_main)
+if(NOT ANDROID)
+    target_link_libraries(packet_flight_recorder_tests PRIVATE pthread)
+endif()
+gtest_discover_tests(packet_flight_recorder_tests)
+
 add_executable(wake_channel_tests TestWakeChannel.cpp)
 target_compile_features(wake_channel_tests PRIVATE cxx_std_17)
 target_link_libraries(wake_channel_tests PRIVATE
