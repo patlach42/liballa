@@ -23,6 +23,7 @@
 #include <thread>
 #include <string>
 #include <chrono>
+#include <cmath>
 #include <vector>
 
 namespace guitarrackcraft {
@@ -260,7 +261,10 @@ public:
             }
         }
         driver_.commitCaptureRead(region);
-        if (decodeChannels > 0) inspectCapture(destinations[0], decodedFrames);
+        if (decodeChannels > 0) {
+            inspectCapture(destinations[0], decodedFrames);
+            inspectCaptureLevel(destinations[0], decodedFrames);
+        }
         return decodedFrames;
     }
 
@@ -340,6 +344,18 @@ public:
             threshold > 0.0f ? threshold : 0.0f, std::memory_order_release);
     }
 
+    // Flag the captured level wandering from its own running average by more
+    // than this fraction. Zero disables the check.
+    //
+    // A steady tone must come back steady. Measured as RMS over a window long
+    // enough to be phase-independent: a 64 frame block covers only 59% of a
+    // 440 Hz period, so its peak swings with phase alone and would be useless
+    // as an envelope.
+    void setCaptureModulationThreshold(float threshold) noexcept {
+        captureModulationThreshold_.store(
+            threshold > 0.0f ? threshold : 0.0f, std::memory_order_release);
+    }
+
     // The same check on captured input, as a fraction of the signal's own
     // decaying peak so it is independent of input gain. With a loopback from
     // output one to input one this covers the DAC, the cable and the ADC.
@@ -382,6 +398,61 @@ public:
     }
 
 private:
+    // Envelope of the captured signal, as RMS over a window spanning many
+    // periods so it does not follow the waveform's own phase. A steady tone
+    // returning at a wandering level means the output is modulated - which is
+    // what summing with a delayed copy at a drifting delay produces, and what
+    // a listener described as the wave overlapping itself.
+    void inspectCaptureLevel(const float* samples, int frames) noexcept {
+        const float threshold =
+            captureModulationThreshold_.load(std::memory_order_relaxed);
+        if (threshold <= 0.0f || !samples || frames <= 0 ||
+            !driver_.flightRecorder().enabled()) {
+            return;
+        }
+        for (int frame = 0; frame < frames; ++frame) {
+            const double sample = samples[frame];
+            levelSum_ += sample * sample;
+            if (++levelCount_ < kLevelWindowFrames) continue;
+
+            const float level = static_cast<float>(
+                std::sqrt(levelSum_ / static_cast<double>(levelCount_)));
+            levelSum_ = 0.0;
+            levelCount_ = 0;
+            // Ignore silence: a relative deviation means nothing without one.
+            if (level < 0.01f) {
+                levelReference_ = level;
+                levelWindows_ = 0;
+                continue;
+            }
+            if (levelReference_ <= 0.0f) { levelReference_ = level; continue; }
+            // Let the reference converge before judging anything against it.
+            // While the signal ramps up, every window differs from a reference
+            // that is still chasing it, which produced 52 spurious events in
+            // the first seconds of a run.
+            if (++levelWindows_ <= kLevelWarmupWindows) {
+                levelReference_ += (level - levelReference_) * 0.5f;
+                continue;
+            }
+
+            const float deviation =
+                std::fabs(level - levelReference_) / levelReference_;
+            if (deviation > threshold) {
+                driver_.flightRecorder().record(
+                    monotrypt::usb::PacketFlightRecorder::Event::
+                        CaptureModulation,
+                    monotrypt::usb::monotonicNowNs(),
+                    static_cast<uint32_t>(deviation * 10000.0f),
+                    static_cast<uint32_t>(level * 10000.0f),
+                    static_cast<uint32_t>(levelReference_ * 10000.0f),
+                    static_cast<uint32_t>(driver_.writtenFrames()));
+            }
+            // Slow reference so it tracks a genuine level change over seconds
+            // without following the modulation being measured.
+            levelReference_ += (level - levelReference_) * 0.05f;
+        }
+    }
+
     // Relative to a decaying peak rather than to full scale: the loopback level
     // depends on the device's output and input gain, which the driver does not
     // know. A 440 Hz tone steps by 5.8% of its own peak between samples, so a
@@ -673,6 +744,16 @@ private:
     std::atomic<uint64_t> playbackQuantumDrops_{0};
     std::atomic<float> discontinuityThreshold_{0.0f};
     std::atomic<float> captureDiscontinuityThreshold_{0.0f};
+    std::atomic<float> captureModulationThreshold_{0.0f};
+    // 4096 frames is about 37 periods of a 440 Hz tone at 48 kHz, enough for
+    // the RMS to be independent of where the window falls in the waveform.
+    static constexpr int kLevelWindowFrames = 4096;
+    // About 1.7 s at 48 kHz, comfortably past any start-up ramp.
+    static constexpr int kLevelWarmupWindows = 20;
+    double levelSum_ = 0.0;
+    int levelCount_ = 0;
+    int levelWindows_ = 0;
+    float levelReference_ = 0.0f;
     float capturePrevious_ = 0.0f;
     float capturePeak_ = 0.0f;
     bool captureSeeded_ = false;

@@ -107,6 +107,15 @@ public:
         // relative to that peak, `b` the frame, ringFrames the peak itself
         // scaled by 10000.
         CaptureDiscontinuity = 11,
+        // Amplitude modulation of the captured loopback. A steady tone should
+        // come back at a steady level; if its envelope wanders, the output is
+        // being modulated. Summing a signal with a delayed copy of itself at a
+        // drifting delay does exactly that, and unlike a discontinuity it is
+        // perfectly smooth, so no step detector can see it.
+        //
+        // `a` is the deviation from the running level scaled by 10000, `b` the
+        // level itself scaled by 10000, and ringFrames the reference level.
+        CaptureModulation = 12,
     };
 
     struct Record {
@@ -181,7 +190,8 @@ public:
                maskOf(Event::DeferredNoPcm) |
                maskOf(Event::SignalDiscontinuity) |
                maskOf(Event::TransferDiscontinuity) |
-               maskOf(Event::CaptureDiscontinuity);
+               maskOf(Event::CaptureDiscontinuity) |
+               maskOf(Event::CaptureModulation);
     }
 
     // Freeze the buffer the first time `trigger` is recorded, the way an

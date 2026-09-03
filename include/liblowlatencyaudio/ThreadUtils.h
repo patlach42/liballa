@@ -135,6 +135,12 @@ public:
             dlsym(library_, "APerformanceHint_closeSession"));
         setThreads_ = reinterpret_cast<SetThreadsFn>(
             dlsym(library_, "APerformanceHint_setThreads"));
+        // Newer platforms let a session say it would rather have performance
+        // than efficiency. Resolved dynamically like the rest, so an older
+        // device simply does not get it.
+        setPreferPowerEfficiency_ =
+            reinterpret_cast<SetPreferPowerEfficiencyFn>(
+                dlsym(library_, "APerformanceHint_setPreferPowerEfficiency"));
         if (!getManager_ || !createSession_ || !reportActual_ || !closeSession_) {
             dlclose(library_);
             library_ = nullptr;
@@ -150,6 +156,12 @@ public:
             session_ = createSession_(
                 manager, initialThreadIds, initialThreadCount,
                 targetDurationNs);
+        }
+        // Audio has a fixed deadline every quantum, so a clock chosen for
+        // battery life is the wrong trade here: missing the deadline costs a
+        // dropout, and there is no way to make that up later.
+        if (session_ && setPreferPowerEfficiency_) {
+            (void)setPreferPowerEfficiency_(session_, false);
         }
 #else
         (void)targetDurationNs;
@@ -203,6 +215,7 @@ private:
     using CreateSessionFn = void* (*)(void*, const int32_t*, size_t, int64_t);
     using ReportActualFn = int (*)(void*, int64_t);
     using SetThreadsFn = int (*)(void*, const int32_t*, size_t);
+    using SetPreferPowerEfficiencyFn = int (*)(void*, bool);
     using CloseSessionFn = void (*)(void*);
 
     void* library_ = nullptr;
@@ -211,6 +224,7 @@ private:
     CreateSessionFn createSession_ = nullptr;
     ReportActualFn reportActual_ = nullptr;
     SetThreadsFn setThreads_ = nullptr;
+    SetPreferPowerEfficiencyFn setPreferPowerEfficiency_ = nullptr;
     CloseSessionFn closeSession_ = nullptr;
 #endif
 };

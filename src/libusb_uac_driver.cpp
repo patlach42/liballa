@@ -12,6 +12,8 @@
 #include <cstring>
 #include <chrono>
 #include <cmath>
+#include <sys/resource.h>
+#include <sys/mman.h>
 #include <utility>
 #include <cerrno>
 #include <poll.h>
@@ -92,6 +94,31 @@ void subtractQueued(std::atomic<uint64_t>& value, uint64_t amount) noexcept {
 
 } // namespace
 
+namespace {
+
+// Pin the transport rings so memory pressure cannot page them out from under
+// the USB completion path. Bounded and best effort: RLIMIT_MEMLOCK is small
+// for an ordinary app, mlockall is never used, and a refusal is not an error -
+// the rings work either way, they are merely evictable.
+//
+// The pages are already resident: the rings are filled at construction, so
+// this protects against later eviction rather than a first-touch fault.
+bool lockRingPages(void* data, size_t bytes) noexcept {
+#if defined(__linux__)
+    if (!data || bytes == 0) return false;
+    rlimit limit{};
+    if (getrlimit(RLIMIT_MEMLOCK, &limit) != 0) return false;
+    if (limit.rlim_cur != RLIM_INFINITY && limit.rlim_cur < bytes) return false;
+    return ::mlock(data, bytes) == 0;
+#else
+    (void)data;
+    (void)bytes;
+    return false;
+#endif
+}
+
+} // namespace
+
 LibusbUacDriver::LibusbUacDriver() {
     ring_.resize(kRingBytes);
     ringMask_ = kRingBytes - 1;
@@ -99,10 +126,30 @@ LibusbUacDriver::LibusbUacDriver() {
     captureRingMask_ = kCaptureRingBytes - 1;
     captureWake_.open();
     playbackWake_.open();
+    // Both rings together, so the limit is checked against what we actually
+    // want rather than granted for one and refused for the other.
+    // Unlock the first if the second is refused, so a partial lock is not left
+    // behind: RLIMIT_MEMLOCK on the reference device is 64 KiB, exactly one
+    // ring, so this is the normal outcome rather than an edge case.
+    if (lockRingPages(ring_.data(), ring_.size())) {
+        if (lockRingPages(captureRing_.data(), captureRing_.size())) {
+            ringsLocked_ = true;
+        } else {
+#if defined(__linux__)
+            (void)::munlock(ring_.data(), ring_.size());
+#endif
+        }
+    }
 }
 LibusbUacDriver::~LibusbUacDriver() {
     stop();
     close();
+#if defined(__linux__)
+    if (ringsLocked_) {
+        (void)::munlock(ring_.data(), ring_.size());
+        (void)::munlock(captureRing_.data(), captureRing_.size());
+    }
+#endif
     if (ctx_ && (inflight_.load(std::memory_order_acquire) != 0 ||
                  captureInflight_.load(std::memory_order_acquire) != 0)) {
         // Normal control-path teardown is bounded. Destruction is the final
