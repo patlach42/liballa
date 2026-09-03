@@ -75,6 +75,13 @@ public:
         PlaybackUnderrun = 5,
         // A playback transfer was deferred awaiting implicit metadata or PCM.
         TransferDeferred = 6,
+        // Why the deferral happened. The two have different causes and
+        // different fixes, so they are separate events: metadata means capture
+        // has not yet delivered the packet layouts this transfer needs, PCM
+        // means the render side has not produced the audio.
+        // `a` carries what was available, `b` what was required.
+        DeferredNoMetadata = 7,
+        DeferredNoPcm = 8,
     };
 
     struct Record {
@@ -144,7 +151,9 @@ public:
     static constexpr uint32_t anomalyMask() noexcept {
         return maskOf(Event::QuantumRefused) |
                maskOf(Event::PlaybackUnderrun) |
-               maskOf(Event::TransferDeferred);
+               maskOf(Event::TransferDeferred) |
+               maskOf(Event::DeferredNoMetadata) |
+               maskOf(Event::DeferredNoPcm);
     }
 
     // Freeze the buffer the first time `trigger` is recorded, the way an

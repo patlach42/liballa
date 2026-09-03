@@ -23,21 +23,30 @@ requires profile-specific device evidence rather than a hidden driver floor.
 Retain raw telemetry and summarize the minimum stable quantum, host queue
 frames/ms, pending-transfer high-water/age, and failure counters.
 
-## Deferred transfers are audible
+## Deferred transfers are pressure, not damage
 
 A deferred OUT transfer is the correct response to missing capture metadata or
-PCM - the driver must never fabricate an implicit layout - but the device still
-loses that service slot, and a listener hears it.
+PCM - the driver must never fabricate an implicit layout - and it is not by
+itself an audible fault.
 
-Two four-minute runs of the same profile on an Audient iD4, with a listener
-present: six deferrals plus one admission refusal against eight clicks reported,
-and on the next run two anomalies against one click. Every other counter -
-playback xruns, inserted silence, zero-runway events, capture drops, metadata
-FIFO overruns - stayed at zero throughout, so the aggregate gate passed a
-configuration that was plainly not clean.
+Four listening runs of four minutes each on an Audient iD4 settled this. The
+deferral count varied across three orders of magnitude between them, from 5 to
+70855, while a listener reported seven to nine clicks in every run regardless.
+Most of the variation tracked how often the instrumentation polled the stats:
+raising the poll interval from 10 ms to 250 ms cut deferrals from 70855 to 5914
+and changed what was heard from nine clicks to seven.
 
-Certification therefore requires zero deferral growth alongside the other
-counters. A profile whose only fault is deferrals is not a passing profile.
+Two consequences. Deferral growth must not gate certification, since it largely
+measures how noisy the harness is. And the harness itself has to be quiet
+before its numbers mean anything: a validation loop that allocates a stats
+object, a JNI array, transport info and the track list a hundred times a second
+perturbs the process that owns the render thread.
+
+The audible clicks in those runs are still unexplained. They were invariant to
+geometry, to the write headroom, to the flight recorder being enabled, and
+largely to the poll rate, while playback xruns and zero-runway events stayed at
+one per four minutes. Whatever causes them is not the admission or deferral
+path.
 
 ## Diagnostics ladder
 

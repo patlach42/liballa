@@ -2501,7 +2501,17 @@ bool LibusbUacDriver::prepareImplicitTransfer(libusb_transfer* xfr) {
     size_t read = implicitRead_.load(std::memory_order_acquire);
     for (;;) {
         const size_t write = implicitWrite_.load(std::memory_order_acquire);
-        if (write < read || write - read < count) return false;
+        if (write < read || write - read < count) {
+            flightRecorder_.record(
+                PacketFlightRecorder::Event::DeferredNoMetadata,
+                monotonicNowNs(),
+                static_cast<uint32_t>(write < read ? 0 : write - read),
+                static_cast<uint32_t>(count),
+                static_cast<uint32_t>(bufferedFrames()),
+                static_cast<uint32_t>(
+                    queuedOutFrames_.load(std::memory_order_relaxed)));
+            return false;
+        }
         int transferFrames = 0;
         for (size_t packet = 0; packet < count; ++packet) {
             frameCounts[packet] = std::min<int>(
@@ -2514,7 +2524,17 @@ bool LibusbUacDriver::prepareImplicitTransfer(libusb_transfer* xfr) {
         // A completed OUT transfer still has the other in-flight URBs in
         // front of it. Defer resubmission until rendered PCM is ready instead
         // of committing audible silence several milliseconds early.
-        if (bufferedFrames() < transferFrames) return false;
+        const int buffered = bufferedFrames();
+        if (buffered < transferFrames) {
+            flightRecorder_.record(
+                PacketFlightRecorder::Event::DeferredNoPcm, monotonicNowNs(),
+                static_cast<uint32_t>(buffered < 0 ? 0 : buffered),
+                static_cast<uint32_t>(transferFrames),
+                static_cast<uint32_t>(buffered < 0 ? 0 : buffered),
+                static_cast<uint32_t>(
+                    queuedOutFrames_.load(std::memory_order_relaxed)));
+            return false;
+        }
         if (implicitRead_.compare_exchange_weak(
                 read, read + count, std::memory_order_acq_rel,
                 std::memory_order_acquire)) {
