@@ -261,9 +261,17 @@ public:
             }
         }
         driver_.commitCaptureRead(region);
-        if (decodeChannels > 0) {
-            inspectCapture(destinations[0], decodedFrames);
-            inspectCaptureLevel(destinations[0], decodedFrames);
+        // The loopback need not arrive on the first channel: an interface with
+        // an internal loop returns it on the pair that the playback pair feeds.
+        // If the requested channel is not among the decoded ones, skip and
+        // count it rather than inspecting a neighbour: output attributed to a
+        // channel nobody selected is worse than no output at all.
+        const int inspect = captureInspectChannel_.load(std::memory_order_relaxed);
+        if (inspect < decodeChannels) {
+            inspectCapture(destinations[inspect], decodedFrames);
+            inspectCaptureLevel(destinations[inspect], decodedFrames);
+        } else if (decodeChannels > 0) {
+            captureInspectSkips_.fetch_add(1, std::memory_order_relaxed);
         }
         return decodedFrames;
     }
@@ -354,6 +362,31 @@ public:
     void setCaptureModulationThreshold(float threshold) noexcept {
         captureModulationThreshold_.store(
             threshold > 0.0f ? threshold : 0.0f, std::memory_order_release);
+    }
+
+    // Which decoded capture channel the loopback detectors watch. Zero based;
+    // a channel the format does not decode is not inspected at all, and the
+    // skipped blocks are counted rather than redirected to a neighbour.
+    void setCaptureInspectChannel(int channel) noexcept {
+        captureInspectChannel_.store(channel < 0 ? 0 : channel,
+                                     std::memory_order_relaxed);
+        // The detectors carry state between blocks. Kept across a switch, the
+        // first block of the new channel is compared against the last sample
+        // and the running level of the old one, which reports a break and a
+        // level swing that never happened.
+        capturePrevious_ = 0.0f;
+        capturePeak_ = 0.0f;
+        captureSeeded_ = false;
+        levelSum_ = 0.0;
+        levelCount_ = 0;
+        levelWindows_ = 0;
+        levelReference_ = 0.0f;
+    }
+    int captureInspectChannel() const noexcept {
+        return captureInspectChannel_.load(std::memory_order_relaxed);
+    }
+    uint64_t captureInspectSkips() const noexcept {
+        return captureInspectSkips_.load(std::memory_order_relaxed);
     }
 
     // The same check on captured input, as a fraction of the signal's own
@@ -743,6 +776,9 @@ private:
     std::atomic<uint32_t> activeWriters_{0};
     std::atomic<uint64_t> playbackQuantumDrops_{0};
     std::atomic<float> discontinuityThreshold_{0.0f};
+    std::atomic<int> captureInspectChannel_{0};
+    // Blocks left uninspected because the requested channel was not decoded.
+    std::atomic<uint64_t> captureInspectSkips_{0};
     std::atomic<float> captureDiscontinuityThreshold_{0.0f};
     std::atomic<float> captureModulationThreshold_{0.0f};
     // 4096 frames is about 37 periods of a 440 Hz tone at 48 kHz, enough for
