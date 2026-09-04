@@ -25,6 +25,7 @@
 #include <thread>
 #include <mutex>
 #include <vector>
+#include <limits>
 
 #include <libusb.h>
 #include "UsbScheduling.h"
@@ -344,11 +345,24 @@ public:
     }
     // Exact silence inserted into submitted ISO packets. Unlike the xrun
     // transition count, these counters reveal sustained starvation.
-    uint64_t playbackSilentPacketCount() const noexcept {
-        return playbackSilentPackets_.load(std::memory_order_acquire);
+    uint64_t deferredNoMetadataCount() const noexcept {
+        return deferredNoMetadata_.load(std::memory_order_acquire);
     }
-    uint64_t playbackSilentFrameCount() const noexcept {
-        return playbackSilentFrames_.load(std::memory_order_acquire);
+    uint64_t deferredNoPcmCount() const noexcept {
+        return deferredNoPcm_.load(std::memory_order_acquire);
+    }
+    // Zero before the first completion, so "never observed" and "ran dry" read
+    // alike: in both cases no runway was ever proven.
+    uint64_t queuedOutLowWaterFrames() const noexcept {
+        const uint64_t value =
+            queuedOutLowWater_.load(std::memory_order_acquire);
+        return value == std::numeric_limits<uint64_t>::max() ? 0 : value;
+    }
+    uint64_t playbackShortPacketCount() const noexcept {
+        return playbackShortPackets_.load(std::memory_order_acquire);
+    }
+    uint64_t playbackShortFrameCount() const noexcept {
+        return playbackShortFrames_.load(std::memory_order_acquire);
     }
 
     // Total PCM frames the iso pump has drained from the ring since
@@ -584,8 +598,19 @@ private:
     std::atomic<uint64_t> playbackUnderruns_{0};
     std::atomic<bool> playbackOverrunActive_{false};
     std::atomic<bool> playbackUnderrunActive_{false};
-    std::atomic<uint64_t> playbackSilentPackets_{0};
-    std::atomic<uint64_t> playbackSilentFrames_{0};
+    // Why implicit transfers were deferred. The flight recorder carries the
+    // detail, but a run has to be attributable without dumping it: metadata
+    // means capture has not delivered the packet layouts, PCM means the render
+    // side has not produced the audio, and the two have different fixes.
+    std::atomic<uint64_t> deferredNoMetadata_{0};
+    std::atomic<uint64_t> deferredNoPcm_{0};
+    // Smallest submitted OUT runway seen while streaming. This is the leading
+    // indicator: it falls before anything is heard, whereas an underrun is
+    // reported only once the runway is already gone.
+    std::atomic<uint64_t> queuedOutLowWater_{
+        std::numeric_limits<uint64_t>::max()};
+    std::atomic<uint64_t> playbackShortPackets_{0};
+    std::atomic<uint64_t> playbackShortFrames_{0};
     std::atomic<bool> playbackStarted_{false};
     std::thread eventThread_;
     std::atomic<bool> deferOutputStart_{false};

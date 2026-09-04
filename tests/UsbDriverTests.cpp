@@ -343,67 +343,84 @@ TEST(UsbDriverRing, WatermarkRejectsPartialFrameAsBackpressureWithoutPlaybackXru
     EXPECT_EQ(driver.playbackBackpressureCount(), 1u);
     EXPECT_EQ(driver.playbackXRunCount(), 0u);
 }
-TEST(UsbDriverRing, DrainStarvationPadsSilenceAndCountsPlaybackUnderrun) {
+TEST(UsbDriverRing, DrainStarvationShortensInsteadOfPaddingAndCountsUnderrun) {
     monotrypt::usb::LibusbUacDriver driver;
     monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
 
     constexpr int frameStride = 4;
     constexpr int outputFrames = 2;
     const int outputBytes = outputFrames * frameStride;
-    std::vector<uint8_t> output(outputBytes, 0xA5);
+    const std::vector<uint8_t> untouched(outputBytes, 0xA5);
+    std::vector<uint8_t> output(untouched);
     EXPECT_EQ(monotrypt::usb::UsbDriverTestAccess::drain(
                   driver, output.data(), outputBytes),
               0);
     EXPECT_EQ(driver.playbackXRunCount(), 0u);
     EXPECT_EQ(driver.playbackBackpressureCount(), 0u);
 
-    // Any pre-start padding is not an audible underrun. Compare exact
-    // silence totals against this baseline so the post-start contract is
-    // independent of whether the driver records pre-start padding.
-    const uint64_t silentPacketBaseline = driver.playbackSilentPacketCount();
-    const uint64_t silentFrameBaseline = driver.playbackSilentFrameCount();
+    // Pre-start starvation is not an audible underrun. Compare against this
+    // baseline so the post-start contract does not depend on whether the
+    // driver counts what happens before playback starts.
+    const uint64_t shortPacketBaseline = driver.playbackShortPacketCount();
+    const uint64_t shortFrameBaseline = driver.playbackShortFrameCount();
 
     monotrypt::usb::UsbDriverTestAccess::playbackStarted(driver, true);
-    std::fill(output.begin(), output.end(), 0xA5);
+    output = untouched;
     EXPECT_EQ(monotrypt::usb::UsbDriverTestAccess::drain(
                   driver, output.data(), outputBytes),
               0);
-    EXPECT_EQ(output, std::vector<uint8_t>(output.size(), 0));
+    // Nothing was written: the caller ships a packet of the drained length, so
+    // a starved packet carries no bytes rather than fabricated silence.
+    EXPECT_EQ(output, untouched);
+    EXPECT_EQ(driver.playedFrames(), 0);
     EXPECT_EQ(driver.playbackXRunCount(), 1u);
     EXPECT_EQ(driver.playbackBackpressureCount(), 0u);
-    EXPECT_EQ(driver.playbackSilentPacketCount(), silentPacketBaseline + 1);
-    EXPECT_EQ(driver.playbackSilentFrameCount(), silentFrameBaseline + outputFrames);
+    EXPECT_EQ(driver.playbackShortPacketCount(), shortPacketBaseline + 1);
+    EXPECT_EQ(driver.playbackShortFrameCount(),
+              shortFrameBaseline + outputFrames);
 
-    // Adjacent starvation inserts another padded packet and its exact frame
-    // count, while the xrun transition remains latched at one event.
+    // Adjacent starvation counts another short packet and its exact frame
+    // count, while the xrun transition stays latched at one event.
     EXPECT_EQ(monotrypt::usb::UsbDriverTestAccess::drain(
                   driver, output.data(), outputBytes),
               0);
     EXPECT_EQ(driver.playbackXRunCount(), 1u);
-    EXPECT_EQ(driver.playbackSilentPacketCount(), silentPacketBaseline + 2);
-    EXPECT_EQ(driver.playbackSilentFrameCount(), silentFrameBaseline + 2 * outputFrames);
+    EXPECT_EQ(driver.playbackShortPacketCount(), shortPacketBaseline + 2);
+    EXPECT_EQ(driver.playbackShortFrameCount(),
+              shortFrameBaseline + 2 * outputFrames);
 
-    // A full packet clears the starvation latch. The next empty packet must
-    // therefore create a new xrun transition and continue both totals.
+    // A full packet clears the starvation latch and is delivered whole, and
+    // only those frames count as played.
     const std::vector<uint8_t> input(outputBytes, 0x5A);
     ASSERT_EQ(driver.writePcm(input.data(), outputFrames), outputFrames);
-    std::fill(output.begin(), output.end(), 0xA5);
+    output = untouched;
     ASSERT_EQ(monotrypt::usb::UsbDriverTestAccess::drain(
                   driver, output.data(), outputBytes),
               outputBytes);
     EXPECT_EQ(output, input);
+    EXPECT_EQ(driver.playedFrames(), outputFrames);
     EXPECT_EQ(driver.playbackXRunCount(), 1u);
-    EXPECT_EQ(driver.playbackSilentPacketCount(), silentPacketBaseline + 2);
-    EXPECT_EQ(driver.playbackSilentFrameCount(), silentFrameBaseline + 2 * outputFrames);
+    EXPECT_EQ(driver.playbackShortPacketCount(), shortPacketBaseline + 2);
+    EXPECT_EQ(driver.playbackShortFrameCount(),
+              shortFrameBaseline + 2 * outputFrames);
 
-    std::fill(output.begin(), output.end(), 0xA5);
+    // A partial packet delivers exactly the frames that exist and reports the
+    // shortfall, leaving the rest of the caller's buffer alone.
+    ASSERT_EQ(driver.writePcm(input.data(), 1), 1);
+    output = untouched;
     EXPECT_EQ(monotrypt::usb::UsbDriverTestAccess::drain(
                   driver, output.data(), outputBytes),
-              0);
-    EXPECT_EQ(output, std::vector<uint8_t>(output.size(), 0));
+              frameStride);
+    EXPECT_EQ(std::vector<uint8_t>(output.begin(), output.begin() + frameStride),
+              std::vector<uint8_t>(input.begin(), input.begin() + frameStride));
+    EXPECT_EQ(std::vector<uint8_t>(output.begin() + frameStride, output.end()),
+              std::vector<uint8_t>(untouched.begin() + frameStride,
+                                   untouched.end()));
+    EXPECT_EQ(driver.playedFrames(), outputFrames + 1);
     EXPECT_EQ(driver.playbackXRunCount(), 2u);
-    EXPECT_EQ(driver.playbackSilentPacketCount(), silentPacketBaseline + 3);
-    EXPECT_EQ(driver.playbackSilentFrameCount(), silentFrameBaseline + 3 * outputFrames);
+    EXPECT_EQ(driver.playbackShortPacketCount(), shortPacketBaseline + 3);
+    EXPECT_EQ(driver.playbackShortFrameCount(),
+              shortFrameBaseline + 2 * outputFrames + 1);
 }
 TEST(UsbDriverTelemetry, ResetRealtimeCountersClearsXrunsOnly) {
     resetMock();
@@ -688,6 +705,11 @@ TEST(UsbDriverFeedback, HighSpeedFeedbackScalesMicroframeRateToPacketRate) {
     EXPECT_EQ(monotrypt::usb::UsbDriverTestAccess::feedbackRate(driver),
               static_cast<uint32_t>(48u << 16));
 
+    // The scheduled length is only observable when the ring can supply it: a
+    // starved packet is shortened to the frames that exist, never padded.
+    const std::vector<uint8_t> pcm(96, 0x5A);
+    ASSERT_EQ(driver.writePcm(pcm.data(), 48), 48);
+
     std::vector<uint8_t> packet(96, 0);
     auto* xfr = makeTransfer(packet);
     ASSERT_NE(xfr, nullptr);
@@ -899,8 +921,8 @@ TEST(UsbDriverImplicit, PrepareDefersUntilWholeTransferPcmAndPreservesPendingOrd
     EXPECT_EQ(monotrypt::usb::UsbDriverTestAccess::implicitRead(driver), 0u);
     EXPECT_EQ(driver.bufferedFrames(), 4);
     EXPECT_EQ(driver.playbackXRunCount(), 0u);
-    EXPECT_EQ(driver.playbackSilentPacketCount(), 0u);
-    EXPECT_EQ(driver.playbackSilentFrameCount(), 0u);
+    EXPECT_EQ(driver.playbackShortPacketCount(), 0u);
+    EXPECT_EQ(driver.playbackShortFrameCount(), 0u);
     EXPECT_EQ(firstPayload, untouchedFirst);
     EXPECT_EQ(first->iso_packet_desc[0].length, 12u);
     EXPECT_EQ(first->iso_packet_desc[1].length, 12u);
@@ -917,8 +939,8 @@ TEST(UsbDriverImplicit, PrepareDefersUntilWholeTransferPcmAndPreservesPendingOrd
     // Both completions belong to one contiguous zero-runway episode: the
     // second pending completion must not double-count the same gap.
     EXPECT_EQ(driver.playbackXRunCount(), 1u);
-    EXPECT_EQ(driver.playbackSilentPacketCount(), 0u);
-    EXPECT_EQ(driver.playbackSilentFrameCount(), 0u);
+    EXPECT_EQ(driver.playbackShortPacketCount(), 0u);
+    EXPECT_EQ(driver.playbackShortFrameCount(), 0u);
 
     ASSERT_EQ(driver.writePcm(pcm.data() + 4 * 4, 3), 3);
     ASSERT_EQ(driver.bufferedFrames(), 7);
@@ -929,8 +951,8 @@ TEST(UsbDriverImplicit, PrepareDefersUntilWholeTransferPcmAndPreservesPendingOrd
     EXPECT_EQ(driver.bufferedFrames(), 0);
     EXPECT_EQ(driver.playedFrames(), 7);
     EXPECT_EQ(driver.playbackXRunCount(), 1u);
-    EXPECT_EQ(driver.playbackSilentPacketCount(), 0u);
-    EXPECT_EQ(driver.playbackSilentFrameCount(), 0u);
+    EXPECT_EQ(driver.playbackShortPacketCount(), 0u);
+    EXPECT_EQ(driver.playbackShortFrameCount(), 0u);
     // Completing the restored seven-frame runway clears the episode latch.
     // A later short completion therefore starts exactly one new episode.
     std::vector<uint8_t> thirdPayload(7 * 4, 0xCD);
@@ -1232,8 +1254,10 @@ TEST(UsbDriverLifecycle, QueuedOutFramesTracksCompletionAndStop) {
     monotrypt::usb::UsbDriverTestAccess::isoStartupState(driver);
     std::vector<uint8_t> ring(monotrypt::usb::kPlaybackRingBytes, 0);
     monotrypt::usb::UsbDriverTestAccess::setRingBytes(driver, ring);
+    // Twice the initial set, because packets are now shortened to what the
+    // ring actually holds instead of padded up to their scheduled length.
     monotrypt::usb::UsbDriverTestAccess::playbackCursors(
-        driver, kInitialFrames * kFrameBytes, 0);
+        driver, 2 * kInitialFrames * kFrameBytes, 0);
 
     ASSERT_TRUE(monotrypt::usb::UsbDriverTestAccess::prepareIsoPump(driver));
     ASSERT_TRUE(driver.startPlayback());
@@ -1282,8 +1306,10 @@ TEST(UsbDriverTelemetry, CompletedOutPacketErrorCountsAndResubmits) {
     monotrypt::usb::UsbDriverTestAccess::isoStartupState(driver);
     monotrypt::usb::UsbDriverTestAccess::setRingBytes(
         driver, std::vector<uint8_t>(monotrypt::usb::kPlaybackRingBytes, 0));
+    // Twice the initial set, because packets are now shortened to what the
+    // ring actually holds instead of padded up to their scheduled length.
     monotrypt::usb::UsbDriverTestAccess::playbackCursors(
-        driver, kInitialFrames * kFrameBytes, 0);
+        driver, 2 * kInitialFrames * kFrameBytes, 0);
 
     ASSERT_TRUE(monotrypt::usb::UsbDriverTestAccess::prepareIsoPump(driver));
     ASSERT_TRUE(driver.startPlayback());

@@ -1323,8 +1323,12 @@ bool LibusbUacDriver::start(int sampleRateHz, int bitsPerSample, int channels,
     playbackUnderruns_.store(0, std::memory_order_relaxed);
     playbackOverrunActive_.store(false, std::memory_order_relaxed);
     playbackUnderrunActive_.store(false, std::memory_order_relaxed);
-    playbackSilentPackets_.store(0, std::memory_order_relaxed);
-    playbackSilentFrames_.store(0, std::memory_order_relaxed);
+    playbackShortPackets_.store(0, std::memory_order_relaxed);
+    playbackShortFrames_.store(0, std::memory_order_relaxed);
+    deferredNoMetadata_.store(0, std::memory_order_relaxed);
+    deferredNoPcm_.store(0, std::memory_order_relaxed);
+    queuedOutLowWater_.store(std::numeric_limits<uint64_t>::max(),
+                             std::memory_order_relaxed);
     playbackStarted_.store(false, std::memory_order_relaxed);
     stopRequested_.store(false, std::memory_order_relaxed);
     transportFailed_.store(false, std::memory_order_relaxed);
@@ -2362,7 +2366,12 @@ bool LibusbUacDriver::submitIsoPump() {
         size_t offset = 0;
         for (int packet = 0; packet < xfr->num_iso_packets; ++packet) {
             const int bytes = static_cast<int>(xfr->iso_packet_desc[packet].length);
-            drainRing(xfr->buffer + offset, bytes);
+            // The prime check above guarantees the whole set is covered, so a
+            // short drain here means that invariant broke. Ship what exists
+            // rather than whatever the buffer happened to hold.
+            const int drained = drainRing(xfr->buffer + offset, bytes);
+            xfr->iso_packet_desc[packet].length =
+                static_cast<unsigned int>(drained < 0 ? 0 : drained);
             offset += static_cast<size_t>(bytes);
         }
     }
@@ -2504,6 +2513,7 @@ bool LibusbUacDriver::prepareImplicitTransfer(libusb_transfer* xfr) {
     for (;;) {
         const size_t write = implicitWrite_.load(std::memory_order_acquire);
         if (write < read || write - read < count) {
+            deferredNoMetadata_.fetch_add(1, std::memory_order_relaxed);
             flightRecorder_.record(
                 PacketFlightRecorder::Event::DeferredNoMetadata,
                 monotonicNowNs(),
@@ -2528,6 +2538,7 @@ bool LibusbUacDriver::prepareImplicitTransfer(libusb_transfer* xfr) {
         // of committing audible silence several milliseconds early.
         const int buffered = bufferedFrames();
         if (buffered < transferFrames) {
+            deferredNoPcm_.fetch_add(1, std::memory_order_relaxed);
             flightRecorder_.record(
                 PacketFlightRecorder::Event::DeferredNoPcm, monotonicNowNs(),
                 static_cast<uint32_t>(buffered < 0 ? 0 : buffered),
@@ -2551,7 +2562,14 @@ bool LibusbUacDriver::prepareImplicitTransfer(libusb_transfer* xfr) {
         if (bytes > 0) {
             uint8_t* packetBuffer = libusb_get_iso_packet_buffer(
                 xfr, static_cast<unsigned int>(packet));
-            drainRing(packetBuffer, bytes);
+            // prepareImplicitTransfer only reaches this point with the whole
+            // transfer's frames present, and this callback is the ring's only
+            // consumer, so a short drain is an invariant failure rather than
+            // an underrun. Shorten the packet regardless: the contract is that
+            // nothing but rendered PCM ever leaves.
+            const int drained = drainRing(packetBuffer, bytes);
+            xfr->iso_packet_desc[packet].length =
+                static_cast<unsigned int>(drained < 0 ? 0 : drained);
         }
     }
     return true;
@@ -2604,6 +2622,17 @@ void LibusbUacDriver::onIso(libusb_transfer* xfr) {
             completedFrames += static_cast<uint64_t>(
                 xfr->iso_packet_desc[p].length / queuedStride);
     subtractQueued(queuedOutFrames_, completedFrames);
+    // Sampled where the runway shrinks, which is the only place it can reach a
+    // new minimum: a completion removes frames the device has consumed, and
+    // resubmission adds them back.
+    {
+        const uint64_t runway =
+            queuedOutFrames_.load(std::memory_order_acquire);
+        uint64_t low = queuedOutLowWater_.load(std::memory_order_relaxed);
+        while (runway < low &&
+               !queuedOutLowWater_.compare_exchange_weak(
+                   low, runway, std::memory_order_relaxed)) {}
+    }
     if (xfr->status == LIBUSB_TRANSFER_CANCELLED ||
         stopRequested_.load(std::memory_order_acquire)) {
         inflight_.fetch_sub(1, std::memory_order_acq_rel);
@@ -2684,7 +2713,13 @@ void LibusbUacDriver::onIso(libusb_transfer* xfr) {
             if (bytes > 0) {
                 uint8_t* packetBuffer =
                     libusb_get_iso_packet_buffer(xfr, packet);
-                drainRing(packetBuffer, bytes);
+                // No availability check precedes this path: the packet length
+                // comes from the scheduler or from explicit feedback, not from
+                // what the ring holds. A short drain therefore happens here in
+                // normal operation, and the packet is shortened to match.
+                const int drained = drainRing(packetBuffer, bytes);
+                xfr->iso_packet_desc[packet].length =
+                    static_cast<unsigned int>(drained < 0 ? 0 : drained);
             }
         }
     }
@@ -2768,21 +2803,29 @@ int LibusbUacDriver::drainRing(uint8_t* dst, int bytes) {
         ringTail_.store(tail + n, std::memory_order_release);
     }
     if (n < bytes) {
-        // Underrun — pad with silence so the iso packet still ships.
-        // The DAC hears a click rather than dropping the entire URB.
-        std::memset(dst + n, 0, bytes - n);
+        // Short of the requested bytes. Nothing is fabricated to cover the
+        // gap: the caller shortens the packet to what was actually drained, so
+        // the device receives only rendered PCM or nothing at all.
+        //
+        // The alternative, padding with silence, keeps the packet at its
+        // scheduled length and so keeps the stream aligned with the device
+        // clock - at the price of inventing samples and of counting them as
+        // played. Under a contract that publishes only complete PCM frames,
+        // the misalignment is the honest failure and the invented audio is
+        // not: one is visible in the counters below, the other is audible and
+        // indistinguishable from real output.
         if (playbackStarted_.load(std::memory_order_acquire) &&
             !playbackUnderrunActive_.exchange(true, std::memory_order_acq_rel)) {
             playbackUnderruns_.fetch_add(1, std::memory_order_relaxed);
         }
         const int frameStride = format_.channels * format_.bytesPerSample;
         if (frameStride > 0) {
-            playbackSilentPackets_.fetch_add(1, std::memory_order_relaxed);
-            playbackSilentFrames_.fetch_add(
+            playbackShortPackets_.fetch_add(1, std::memory_order_relaxed);
+            playbackShortFrames_.fetch_add(
                 static_cast<uint64_t>((bytes - n) / frameStride),
                 std::memory_order_relaxed);
             // Recorded per packet, not per episode: the underrun counter above
-            // is edge triggered, so it cannot say how much silence shipped.
+            // is edge triggered, so it cannot say how many frames were short.
             // Every field is in frames; the local arithmetic here is in bytes.
             flightRecorder_.record(
                 PacketFlightRecorder::Event::PlaybackUnderrun, monotonicNowNs(),
@@ -2795,13 +2838,14 @@ int LibusbUacDriver::drainRing(uint8_t* dst, int bytes) {
     } else {
         playbackUnderrunActive_.store(false, std::memory_order_release);
     }
-    inspectTransferContinuity(dst, bytes);
-    // Frames "played" = frames the pump has dispatched, including the
-    // silence padding (since the device hears those samples too). Used
-    // for accurate position reporting back to ExoPlayer.
+    inspectTransferContinuity(dst, n);
+    // Frames "played" = frames actually handed to the device. A short drain
+    // ships a short packet, so the count follows what was drained rather than
+    // what was scheduled; anything else would report audio that was never
+    // sent.
     int frameStride = format_.channels * format_.bytesPerSample;
     if (frameStride > 0) {
-        playedFrames_.fetch_add(bytes / frameStride, std::memory_order_acq_rel);
+        playedFrames_.fetch_add(n / frameStride, std::memory_order_acq_rel);
     }
     return n;
 }

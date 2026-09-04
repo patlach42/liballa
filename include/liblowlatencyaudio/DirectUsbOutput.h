@@ -293,11 +293,22 @@ public:
     uint64_t xrunCount() const noexcept {
         return driver_.playbackXRunCount();
     }
-    uint64_t playbackSilentPacketCount() const noexcept {
-        return driver_.playbackSilentPacketCount();
+    // Deferral causes and the smallest runway seen, so a run is attributable
+    // from telemetry alone rather than from a flight recorder dump.
+    uint64_t deferredNoMetadataCount() const noexcept {
+        return driver_.deferredNoMetadataCount();
     }
-    uint64_t playbackSilentFrameCount() const noexcept {
-        return driver_.playbackSilentFrameCount();
+    uint64_t deferredNoPcmCount() const noexcept {
+        return driver_.deferredNoPcmCount();
+    }
+    uint64_t queuedOutLowWaterFrames() const noexcept {
+        return driver_.queuedOutLowWaterFrames();
+    }
+    uint64_t playbackShortPacketCount() const noexcept {
+        return driver_.playbackShortPacketCount();
+    }
+    uint64_t playbackShortFrameCount() const noexcept {
+        return driver_.playbackShortFrameCount();
     }
     uint64_t playbackBackpressureCount() const noexcept {
         return driver_.playbackBackpressureCount();
