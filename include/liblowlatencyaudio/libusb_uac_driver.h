@@ -398,6 +398,8 @@ public:
     // Credit is granted by played frames and spent by published quanta. Before
     // playback starts there is nothing to pace against: the initial prime is
     // the stock the stream begins with, so it is always admitted.
+    bool waitForWritableFramesUntil(
+        int frames, std::chrono::steady_clock::time_point deadline) const;
     bool waitForPlaybackCreditUntil(
         int frames, std::chrono::steady_clock::time_point deadline) noexcept;
     bool takePlaybackCredit(int frames) noexcept {

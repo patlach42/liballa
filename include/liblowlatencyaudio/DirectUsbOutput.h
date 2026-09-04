@@ -215,6 +215,13 @@ public:
         }
         if (accepting_.load(std::memory_order_acquire) && writable >= frames) {
             const auto region = driver_.preparePlaybackWrite(frames);
+            // Credit is accounted but no longer gates the publish. Pacing the
+            // producer by played frames starves it: frames held as credit are
+            // a right to write, not audio, so the stock the device can play is
+            // prime minus credit, and producer lateness shrinks the buffer one
+            // for one. Measured, that drove the ring to four frames, the OUT
+            // queue to zero and PCM deferrals to forty three thousand. The
+            // producer now waits for room instead, which loses nothing.
             if (region.frames == frames &&
                 packPlaybackRegionForFormat(region, left, right)) {
                 driver_.commitPlaybackWrite(region);
@@ -308,6 +315,10 @@ public:
     }
     int64_t playbackCreditFrames() const noexcept {
         return driver_.playbackCreditFrames();
+    }
+    bool waitForWritableFramesUntil(
+            int frames, std::chrono::steady_clock::time_point deadline) const noexcept {
+        return driver_.waitForWritableFramesUntil(frames, deadline);
     }
     bool waitForWritableFrames(int frames, int timeoutMs) const noexcept {
         return driver_.waitForWritableFrames(frames, timeoutMs);

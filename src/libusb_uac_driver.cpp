@@ -3171,6 +3171,22 @@ bool LibusbUacDriver::waitForPlaybackCreditUntil(
     return playbackCredit_.load(std::memory_order_acquire) >= frames;
 }
 
+bool LibusbUacDriver::waitForWritableFramesUntil(
+        int frames, std::chrono::steady_clock::time_point deadline) const {
+    if (frames <= 0) return true;
+    const WakeChannel::Registration waiting(playbackWake_);
+    while (writableFrames() < frames &&
+           streaming_.load(std::memory_order_acquire) &&
+           !transportFailed_.load(std::memory_order_acquire)) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) break;
+        if (!playbackWake_.poll(static_cast<int>(remaining))) break;
+    }
+    return writableFrames() >= frames;
+}
+
 bool LibusbUacDriver::waitForWritableFrames(int frames, int timeoutMs) const {
     if (frames <= 0) return true;
     const WakeChannel::Registration waiting(playbackWake_);

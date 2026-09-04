@@ -386,6 +386,17 @@ TEST(UsbDriverRing, PlaybackCreditPacesTheProducerToPlayedFrames) {
     EXPECT_TRUE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
     EXPECT_EQ(driver.playbackCreditFrames(), 8);
     EXPECT_FALSE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+
+    // Credit is a right to write, not a token to burn: a take that is not
+    // followed by a publish must not consume it. Spending it before the write
+    // and refusing the write afterwards destroyed the right permanently, and
+    // the producer starved itself while the ring had room.
+    monotrypt::usb::UsbDriverTestAccess::grantCredit(driver, kQuantum);
+    const int64_t before = driver.playbackCreditFrames();
+    EXPECT_TRUE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    EXPECT_EQ(driver.playbackCreditFrames(), before - kQuantum);
+    monotrypt::usb::UsbDriverTestAccess::grantCredit(driver, kQuantum);
+    EXPECT_EQ(driver.playbackCreditFrames(), before);
 }
 
 TEST(UsbDriverRing, DrainStarvationShortensInsteadOfPaddingAndCountsUnderrun) {
