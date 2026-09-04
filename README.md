@@ -82,7 +82,7 @@ The accepted path uses bounded rings, preallocated ISO buffers, eventfd wakeups,
 
 Transfer batching (reserve/copy/publish once per transfer) and coalesced eventfd wakeups (signal transitions rather than every completion) are research candidates. They require lost-wakeup, disconnect, wrap, and contention tests before adoption.
 
-ADPF reporting must describe actual CPU work, not USB wait/backpressure. Choose performance CPUs from observed capacity/frequency and retain permission fallbacks. Prefault bounded buffers off the RT thread; optional `mlock` is limited by `RLIMIT_MEMLOCK`; never use `mlockall`. PGO requires representative production profiles and instrumentation must not ship.
+ADPF reporting must describe actual CPU work, not USB wait/backpressure. Choose performance CPUs from observed capacity/frequency and retain permission fallbacks. Prefault bounded buffers off the RT thread. Ring `mlock` was measured against no pinning and made no difference, so the rings are not pinned; `mlockall` is never used. PGO requires representative production profiles and instrumentation must not ship.
 
 Rejected as generic solutions: global `-ffast-math`/`-Ofast`, `-mcpu=native`, fixed SVE or unverified NEON assumptions, broad allocator replacement, `io_uring` in place of USBFS `SUBMITURB`/reap, and privileged realtime/IRQ/cpufreq/usbfs-kernel tuning. Validate every optimization on physical ARM64 with callback p50/p95/p99, deadline misses, xruns, thermal and power data.
 

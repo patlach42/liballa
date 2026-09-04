@@ -521,8 +521,6 @@ private:
     // Capture availability and playback writability are separate conditions:
     // an OUT completion never adds capture frames, so sharing one channel woke
     // every capture waiter on each OUT completion for nothing.
-    // True when both rings are pinned; best effort, see lockRingPages.
-    bool ringsLocked_ = false;
     WakeChannel captureWake_;
     WakeChannel playbackWake_;
     // Diagnostics only, disabled by default; see PacketFlightRecorder.

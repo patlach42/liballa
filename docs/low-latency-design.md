@@ -10,7 +10,7 @@ The two-span path removed staging PCM vectors. Isolated ARM64 measurements repor
 
 Transfer batching (one reserve/copy/publish per transfer) and coalesced eventfd notifications (signal insufficient-to-enough transitions) may reduce overhead. Before adoption, test wrap, lost wakes, disconnect, stop/restart, contention, packet status accounting, and FIFO order.
 
-ADPF should receive actual CPU work, excluding USB wait/backpressure. Capacity-aware CPU selection, bounded prefaulting off the RT thread, optional bounded `mlock` under `RLIMIT_MEMLOCK`, and representative PGO are setup/benchmark work, not correctness requirements.
+ADPF should receive actual CPU work, excluding USB wait/backpressure. Capacity-aware CPU selection, bounded prefaulting off the RT thread, and representative PGO are setup/benchmark work, not correctness requirements. Ring `mlock` is rejected on measurement, not on argument: pinned and unpinned rings were compared over six randomised blocks at 48 kHz with a 64-frame quantum and multiplier 3, and xruns, quantum drops, scheduler lateness and host queue latency were indistinguishable. `RLIMIT_MEMLOCK` for an ordinary app is 64 KiB there, one ring of the two, and an unaligned ring is refused outright.
 
 ## Rejected approaches
 
