@@ -345,6 +345,116 @@ public:
     }
     // Exact silence inserted into submitted ISO packets. Unlike the xrun
     // transition count, these counters reveal sustained starvation.
+    uint64_t transferDiscontinuityCount() const noexcept {
+        return transferDiscontinuities_.load(std::memory_order_relaxed);
+    }
+    uint64_t implicitMetadataInvalidCount() const noexcept {
+        return implicitMetadataInvalid_.load(std::memory_order_relaxed);
+    }
+    // Occupancy percentile in frames, or zero when nothing was sampled. The
+    // bucket midpoint is returned: the resolution is deliberately coarse, and
+    // pretending otherwise would invent precision the histogram does not have.
+    int ringOccupancyPercentile(double fraction) const noexcept {
+        const uint64_t total = ringOccupancySamples_.load(std::memory_order_acquire);
+        if (total == 0) return 0;
+        const uint64_t target = static_cast<uint64_t>(
+            static_cast<double>(total) * fraction);
+        uint64_t seen = 0;
+        for (int bucket = 0; bucket < kOccupancyBuckets; ++bucket) {
+            seen += ringOccupancy_[bucket].load(std::memory_order_relaxed);
+            if (seen >= target) {
+                return bucket * kOccupancyBucketFrames +
+                       kOccupancyBucketFrames / 2;
+            }
+        }
+        return (kOccupancyBuckets - 1) * kOccupancyBucketFrames;
+    }
+    uint64_t ringOccupancySampleCount() const noexcept {
+        return ringOccupancySamples_.load(std::memory_order_relaxed);
+    }
+    // Starts a fresh measurement epoch. Startup is a different regime from
+    // steady state - the pipeline is still filling and the first completions
+    // have not settled - so mixing them produces an envelope that describes
+    // neither. The caller reads the startup values first, then resets.
+    void resetEnvelopeMetrics() noexcept {
+        lastCompletionNs_ = 0;
+        maxCompletionGapNs_.store(0, std::memory_order_relaxed);
+        maxMissingDrains_.store(0, std::memory_order_relaxed);
+        drainFramesMin_.store(std::numeric_limits<uint64_t>::max(),
+                              std::memory_order_relaxed);
+        drainFramesMax_.store(0, std::memory_order_relaxed);
+        writesSinceDrain_.store(0, std::memory_order_relaxed);
+        maxWritesBetweenDrains_.store(0, std::memory_order_relaxed);
+        ringLowWater_.store(std::numeric_limits<uint64_t>::max(),
+                            std::memory_order_relaxed);
+        ringHighWater_.store(0, std::memory_order_relaxed);
+        queuedOutLowWater_.store(std::numeric_limits<uint64_t>::max(),
+                                 std::memory_order_relaxed);
+        for (auto& bucket : ringOccupancy_) {
+            bucket.store(0, std::memory_order_relaxed);
+        }
+        ringOccupancySamples_.store(0, std::memory_order_relaxed);
+    }
+    // Credit is granted by played frames and spent by published quanta. Before
+    // playback starts there is nothing to pace against: the initial prime is
+    // the stock the stream begins with, so it is always admitted.
+    bool waitForPlaybackCreditUntil(
+        int frames, std::chrono::steady_clock::time_point deadline) noexcept;
+    bool takePlaybackCredit(int frames) noexcept {
+        if (frames <= 0) return true;
+        if (!playbackStarted_.load(std::memory_order_acquire)) return true;
+        int64_t credit = playbackCredit_.load(std::memory_order_relaxed);
+        while (credit >= frames) {
+            if (playbackCredit_.compare_exchange_weak(
+                    credit, credit - frames, std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    int64_t playbackCreditFrames() const noexcept {
+        return playbackCredit_.load(std::memory_order_relaxed);
+    }
+    uint64_t maxCompletionGapNs() const noexcept {
+        return maxCompletionGapNs_.load(std::memory_order_relaxed);
+    }
+    uint64_t maxMissingDrains() const noexcept {
+        return maxMissingDrains_.load(std::memory_order_relaxed);
+    }
+    uint64_t drainFramesMin() const noexcept {
+        const uint64_t v = drainFramesMin_.load(std::memory_order_relaxed);
+        return v == std::numeric_limits<uint64_t>::max() ? 0 : v;
+    }
+    uint64_t drainFramesMax() const noexcept {
+        return drainFramesMax_.load(std::memory_order_relaxed);
+    }
+    uint64_t maxWritesBetweenDrains() const noexcept {
+        return maxWritesBetweenDrains_.load(std::memory_order_relaxed);
+    }
+    // Counted by the writer, cleared by the drain: the burst a headroom has to
+    // hold when the consumer is late.
+    void noteQuantumWritten() noexcept {
+        const uint64_t writes =
+            writesSinceDrain_.fetch_add(1, std::memory_order_relaxed) + 1;
+        uint64_t high = maxWritesBetweenDrains_.load(std::memory_order_relaxed);
+        while (writes > high &&
+               !maxWritesBetweenDrains_.compare_exchange_weak(
+                   high, writes, std::memory_order_relaxed)) {}
+    }
+    uint64_t ringLowWaterFrames() const noexcept {
+        const uint64_t value = ringLowWater_.load(std::memory_order_acquire);
+        return value == std::numeric_limits<uint64_t>::max() ? 0 : value;
+    }
+    uint64_t ringHighWaterFrames() const noexcept {
+        return ringHighWater_.load(std::memory_order_acquire);
+    }
+    // Frames handed to the device per transfer: the granularity the ring is
+    // drained at, and the other half of the alignment question.
+    int drainChunkFrames() const noexcept {
+        const int transfers = transferCount_;
+        return transfers > 0 ? exactInitialPacketFrames_ / transfers : 0;
+    }
     uint64_t deferredNoMetadataCount() const noexcept {
         return deferredNoMetadata_.load(std::memory_order_acquire);
     }
@@ -598,6 +708,13 @@ private:
     std::atomic<uint64_t> playbackUnderruns_{0};
     std::atomic<bool> playbackOverrunActive_{false};
     std::atomic<bool> playbackUnderrunActive_{false};
+    // Packed PCM leaving the ring broke continuity: the last check before the
+    // bytes reach the wire.
+    std::atomic<uint64_t> transferDiscontinuities_{0};
+    // A capture packet that arrived failed or empty, so its frame count went
+    // into the implicit plan as zero. That is not a measurement of what the
+    // device consumed, it is the absence of one.
+    std::atomic<uint64_t> implicitMetadataInvalid_{0};
     // Why implicit transfers were deferred. The flight recorder carries the
     // detail, but a run has to be attributable without dumping it: metadata
     // means capture has not delivered the packet layouts, PCM means the render
@@ -609,6 +726,50 @@ private:
     // reported only once the runway is already gone.
     std::atomic<uint64_t> queuedOutLowWater_{
         std::numeric_limits<uint64_t>::max()};
+    // Playback ring occupancy extremes while streaming. The gap between them
+    // is the latency wobble: the producer adds a whole quantum, the consumer
+    // removes a transfer's worth, and when those do not divide the level walks
+    // a sawtooth whose amplitude is exactly what the reported latency swings
+    // by. Equal extremes mean the pipeline depth is constant.
+    // Occupancy distribution, sampled once per drain so the sample cadence is
+    // the USB one rather than the writer's. Extremes alone cannot separate the
+    // steady sawtooth from a single rare stall: on one run the low water read
+    // zero because of one preemption, which says nothing about the geometry.
+    // Eight frames per bucket covers a 4096 frame ring in 512 buckets.
+    // Jitter envelope, measured before anything is tuned. Each of these is a
+    // term in the admission and depth formulas, and until they are known those
+    // formulas are guesses with arithmetic around them.
+    //
+    // The gap between consecutive OUT completions, and how many nominal drains
+    // fit in the worst one: that is M, the missing drains a headroom has to
+    // absorb. The frames each completion actually removed, since a fixed
+    // nominal is an assumption. And the graph quanta accepted between two
+    // drains, which is B, the catch-up burst.
+    // Frames the device has actually played, minus the frames the producer has
+    // published since. The producer may publish a quantum only against this
+    // credit, which paces it to the device instead of to its own wakeups.
+    //
+    // Without it the startup transient runs the ring past its ceiling: capture
+    // starts before the render thread and accumulates a pre-roll, the producer
+    // works through that backlog even though the initial stock already equals
+    // the target, and the refusal that follows discards a whole quantum. The
+    // credit removes the overshoot without adding a frame of latency, which is
+    // what a deeper prime or a startup-only headroom would both cost.
+    std::atomic<int64_t> playbackCredit_{0};
+    uint64_t lastCompletionNs_ = 0;
+    int nominalTransferNs_ = 0;
+    std::atomic<uint64_t> maxCompletionGapNs_{0};
+    std::atomic<uint64_t> maxMissingDrains_{0};
+    std::atomic<uint64_t> drainFramesMin_{std::numeric_limits<uint64_t>::max()};
+    std::atomic<uint64_t> drainFramesMax_{0};
+    std::atomic<uint64_t> writesSinceDrain_{0};
+    std::atomic<uint64_t> maxWritesBetweenDrains_{0};
+    static constexpr int kOccupancyBuckets = 512;
+    static constexpr int kOccupancyBucketFrames = 8;
+    std::atomic<uint32_t> ringOccupancy_[kOccupancyBuckets] = {};
+    std::atomic<uint64_t> ringOccupancySamples_{0};
+    std::atomic<uint64_t> ringLowWater_{std::numeric_limits<uint64_t>::max()};
+    std::atomic<uint64_t> ringHighWater_{0};
     std::atomic<uint64_t> playbackShortPackets_{0};
     std::atomic<uint64_t> playbackShortFrames_{0};
     std::atomic<bool> playbackStarted_{false};

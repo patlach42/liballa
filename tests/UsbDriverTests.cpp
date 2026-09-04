@@ -167,6 +167,12 @@ struct UsbDriverTestAccess {
         d.onFeedback(xfr);
     }
     static void submitPending(LibusbUacDriver& d) { d.submitPendingImplicitTransfers(); }
+    static bool takeCredit(LibusbUacDriver& d, int frames) {
+        return d.takePlaybackCredit(frames);
+    }
+    static void grantCredit(LibusbUacDriver& d, int frames) {
+        d.playbackCredit_.fetch_add(frames, std::memory_order_acq_rel);
+    }
     static void setRingBytes(LibusbUacDriver& d, const std::vector<uint8_t>& bytes) {
         d.ring_ = bytes;
     }
@@ -343,6 +349,45 @@ TEST(UsbDriverRing, WatermarkRejectsPartialFrameAsBackpressureWithoutPlaybackXru
     EXPECT_EQ(driver.playbackBackpressureCount(), 1u);
     EXPECT_EQ(driver.playbackXRunCount(), 0u);
 }
+TEST(UsbDriverRing, PlaybackCreditPacesTheProducerToPlayedFrames) {
+    monotrypt::usb::LibusbUacDriver driver;
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
+
+    constexpr int kQuantum = 64;
+    // Before playback starts there is nothing to pace against: the initial
+    // prime is the stock the stream begins with.
+    EXPECT_TRUE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    EXPECT_EQ(driver.playbackCreditFrames(), 0);
+
+    monotrypt::usb::UsbDriverTestAccess::playbackStarted(driver, true);
+    // Nothing has played yet, so nothing may be published.
+    EXPECT_FALSE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+
+    // Three transfers of 24 frames grant 72: enough for one quantum, with the
+    // remainder carried forward. That is the 3/3/2 cadence the 192 frame
+    // superperiod implies, and it falls out of the arithmetic rather than
+    // being scheduled.
+    monotrypt::usb::UsbDriverTestAccess::grantCredit(driver, 24);
+    monotrypt::usb::UsbDriverTestAccess::grantCredit(driver, 24);
+    EXPECT_FALSE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    monotrypt::usb::UsbDriverTestAccess::grantCredit(driver, 24);
+    EXPECT_TRUE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    EXPECT_EQ(driver.playbackCreditFrames(), 8);
+
+    // A stalled producer accrues credit and may catch up afterwards, but only
+    // by the deficit that actually built up: three quanta of credit permit
+    // three quanta and no more.
+    for (int transfer = 0; transfer < 8; ++transfer) {
+        monotrypt::usb::UsbDriverTestAccess::grantCredit(driver, 24);
+    }
+    EXPECT_EQ(driver.playbackCreditFrames(), 200);
+    EXPECT_TRUE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    EXPECT_TRUE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    EXPECT_TRUE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    EXPECT_EQ(driver.playbackCreditFrames(), 8);
+    EXPECT_FALSE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+}
+
 TEST(UsbDriverRing, DrainStarvationShortensInsteadOfPaddingAndCountsUnderrun) {
     monotrypt::usb::LibusbUacDriver driver;
     monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);

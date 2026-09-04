@@ -15,7 +15,7 @@ PRIMARY_REQUIRED = ("cycle", "state", "failure", "actual_xrun_growth", "capture_
                     "deadline_miss_growth", "last_dsp_ns", "peak_dsp_ns", "last_cycle_ns",
                     "peak_cycle_ns", "deadline_budget_ns", "known_host_latency_frames")
 LIFECYCLE_REQUIRED = ("lifecycle_after_stop", "state", "failure", "lifecycle_failures")
-SUPPORTED_SCHEMAS = frozenset((3, 4, 5, 6, 7, 8, 9))
+SUPPORTED_SCHEMAS = frozenset((3, 4, 5, 6, 7, 8, 9, 10, 11, 12))
 # Schema 8 (commit b01927b) redefined the aggregate xrun total: it now folds in
 # capturePacketDrops and playbackQuantumDrops alongside the playback xruns and
 # capture over/underruns counted by schemas 3-7. The same physical behaviour

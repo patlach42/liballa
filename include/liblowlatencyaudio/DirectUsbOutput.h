@@ -15,6 +15,7 @@
 #include "liblowlatencyaudio/libusb_uac_driver.h"
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -103,6 +104,8 @@ public:
         // The render thread must fill the ring before startPlayback() arms OUT.
         accepting_.store(true, std::memory_order_release);
         playbackQuantumDrops_.store(0, std::memory_order_relaxed);
+        minAdmissionMargin_.store(std::numeric_limits<int>::max(),
+                                  std::memory_order_relaxed);
         streaming_.store(true, std::memory_order_release);
         return true;
     }
@@ -200,11 +203,22 @@ public:
         activeWriters_.fetch_add(1, std::memory_order_acq_rel);
         bool submitted = false;
         const int writable = driver_.writableFrames();
+        // How close admission came to refusing: the margin the headroom has to
+        // keep positive. Tracked whether or not the block is accepted, so a
+        // refusal shows as a margin below zero rather than as an absence.
+        {
+            const int margin = writable - frames;
+            int lowest = minAdmissionMargin_.load(std::memory_order_relaxed);
+            while (margin < lowest &&
+                   !minAdmissionMargin_.compare_exchange_weak(
+                       lowest, margin, std::memory_order_relaxed)) {}
+        }
         if (accepting_.load(std::memory_order_acquire) && writable >= frames) {
             const auto region = driver_.preparePlaybackWrite(frames);
             if (region.frames == frames &&
                 packPlaybackRegionForFormat(region, left, right)) {
                 driver_.commitPlaybackWrite(region);
+                driver_.noteQuantumWritten();
                 submitted = true;
             }
         }
@@ -283,6 +297,18 @@ public:
             int frames, std::chrono::steady_clock::time_point deadline) const noexcept {
         return driver_.waitForCaptureFramesUntil(frames, deadline);
     }
+    // Paces the producer to the device: a quantum may be rendered only against
+    // frames the device has actually played.
+    bool waitForPlaybackCreditUntil(
+            int frames, std::chrono::steady_clock::time_point deadline) noexcept {
+        return driver_.waitForPlaybackCreditUntil(frames, deadline);
+    }
+    bool takePlaybackCredit(int frames) noexcept {
+        return driver_.takePlaybackCredit(frames);
+    }
+    int64_t playbackCreditFrames() const noexcept {
+        return driver_.playbackCreditFrames();
+    }
     bool waitForWritableFrames(int frames, int timeoutMs) const noexcept {
         return driver_.waitForWritableFrames(frames, timeoutMs);
     }
@@ -303,6 +329,43 @@ public:
     }
     uint64_t queuedOutLowWaterFrames() const noexcept {
         return driver_.queuedOutLowWaterFrames();
+    }
+    uint64_t transferDiscontinuityCount() const noexcept {
+        return driver_.transferDiscontinuityCount();
+    }
+    uint64_t implicitMetadataInvalidCount() const noexcept {
+        return driver_.implicitMetadataInvalidCount();
+    }
+    uint64_t ringLowWaterFrames() const noexcept {
+        return driver_.ringLowWaterFrames();
+    }
+    uint64_t ringHighWaterFrames() const noexcept {
+        return driver_.ringHighWaterFrames();
+    }
+    int drainChunkFrames() const noexcept { return driver_.drainChunkFrames(); }
+    void resetEnvelopeMetrics() noexcept {
+        minAdmissionMargin_.store(std::numeric_limits<int>::max(),
+                                  std::memory_order_relaxed);
+        driver_.resetEnvelopeMetrics();
+    }
+    int minAdmissionMarginFrames() const noexcept {
+        const int value = minAdmissionMargin_.load(std::memory_order_relaxed);
+        return value == std::numeric_limits<int>::max() ? 0 : value;
+    }
+    uint64_t maxCompletionGapNs() const noexcept {
+        return driver_.maxCompletionGapNs();
+    }
+    uint64_t maxMissingDrains() const noexcept { return driver_.maxMissingDrains(); }
+    uint64_t drainFramesMin() const noexcept { return driver_.drainFramesMin(); }
+    uint64_t drainFramesMax() const noexcept { return driver_.drainFramesMax(); }
+    uint64_t maxWritesBetweenDrains() const noexcept {
+        return driver_.maxWritesBetweenDrains();
+    }
+    int ringOccupancyPercentile(double fraction) const noexcept {
+        return driver_.ringOccupancyPercentile(fraction);
+    }
+    uint64_t ringOccupancySampleCount() const noexcept {
+        return driver_.ringOccupancySampleCount();
     }
     uint64_t playbackShortPacketCount() const noexcept {
         return driver_.playbackShortPacketCount();
@@ -399,6 +462,18 @@ public:
     uint64_t captureInspectSkips() const noexcept {
         return captureInspectSkips_.load(std::memory_order_relaxed);
     }
+    uint64_t captureDiscontinuityCount() const noexcept {
+        return captureDiscontinuities_.load(std::memory_order_relaxed);
+    }
+    uint64_t captureModulationCount() const noexcept {
+        return captureModulations_.load(std::memory_order_relaxed);
+    }
+    uint64_t signalDiscontinuityCount() const noexcept {
+        return signalDiscontinuities_.load(std::memory_order_relaxed);
+    }
+    bool captureDetectorArmed() const noexcept {
+        return captureDetectorArmed_.load(std::memory_order_relaxed);
+    }
 
     // The same check on captured input, as a fraction of the signal's own
     // decaying peak so it is independent of input gain. With a loopback from
@@ -482,6 +557,7 @@ private:
             const float deviation =
                 std::fabs(level - levelReference_) / levelReference_;
             if (deviation > threshold) {
+                captureModulations_.fetch_add(1, std::memory_order_relaxed);
                 driver_.flightRecorder().record(
                     monotrypt::usb::PacketFlightRecorder::Event::
                         CaptureModulation,
@@ -521,8 +597,15 @@ private:
             // meaningless while the envelope is still climbing: the first run
             // reported three breaks during the quarter second of ramp-up, at
             // peaks of 0.002 to 0.015, and none of them were real.
+            // Arming is recorded separately from firing: a run where the loop
+            // was silent produces no events for the same reason a clean run
+            // does, and only this flag tells the two apart.
+            if (captureSeeded_ && capturePeak_ > 0.02f) {
+                captureDetectorArmed_.store(true, std::memory_order_relaxed);
+            }
             if (captureSeeded_ && capturePeak_ > 0.02f &&
                 step > threshold * capturePeak_) {
+                captureDiscontinuities_.fetch_add(1, std::memory_order_relaxed);
                 driver_.flightRecorder().record(
                     monotrypt::usb::PacketFlightRecorder::Event::
                         CaptureDiscontinuity,
@@ -554,6 +637,8 @@ private:
                 const float step = value > previous ? value - previous
                                                     : previous - value;
                 if (step > threshold && continuitySeeded_) {
+                    signalDiscontinuities_.fetch_add(
+                        1, std::memory_order_relaxed);
                     driver_.flightRecorder().record(
                         monotrypt::usb::PacketFlightRecorder::Event::
                             SignalDiscontinuity,
@@ -785,8 +870,19 @@ private:
     std::atomic<bool> accepting_{false};
     std::atomic<bool> streaming_{false};
     std::atomic<uint32_t> activeWriters_{0};
+    // Smallest writable-minus-quantum seen; negative means a refusal.
+    std::atomic<int> minAdmissionMargin_{std::numeric_limits<int>::max()};
     std::atomic<uint64_t> playbackQuantumDrops_{0};
     std::atomic<float> discontinuityThreshold_{0.0f};
+    // Detector events are counted, not merely recorded: a counter that never
+    // reaches the verdict protects nothing, and the flight log is a diagnostic
+    // dump rather than a gate.
+    std::atomic<uint64_t> captureDiscontinuities_{0};
+    std::atomic<uint64_t> captureModulations_{0};
+    std::atomic<uint64_t> signalDiscontinuities_{0};
+    // True once the capture detector has seen a level worth judging. Without
+    // it a silent loopback reads exactly like a clean one.
+    std::atomic<bool> captureDetectorArmed_{false};
     std::atomic<int> captureInspectChannel_{0};
     // Blocks left uninspected because the requested channel was not decoded.
     std::atomic<uint64_t> captureInspectSkips_{0};

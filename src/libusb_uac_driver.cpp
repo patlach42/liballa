@@ -1326,9 +1326,25 @@ bool LibusbUacDriver::start(int sampleRateHz, int bitsPerSample, int channels,
     playbackShortPackets_.store(0, std::memory_order_relaxed);
     playbackShortFrames_.store(0, std::memory_order_relaxed);
     deferredNoMetadata_.store(0, std::memory_order_relaxed);
+    transferDiscontinuities_.store(0, std::memory_order_relaxed);
+    implicitMetadataInvalid_.store(0, std::memory_order_relaxed);
     deferredNoPcm_.store(0, std::memory_order_relaxed);
     queuedOutLowWater_.store(std::numeric_limits<uint64_t>::max(),
                              std::memory_order_relaxed);
+    ringLowWater_.store(std::numeric_limits<uint64_t>::max(),
+                        std::memory_order_relaxed);
+    playbackCredit_.store(0, std::memory_order_relaxed);
+    lastCompletionNs_ = 0;
+    maxCompletionGapNs_.store(0, std::memory_order_relaxed);
+    maxMissingDrains_.store(0, std::memory_order_relaxed);
+    drainFramesMin_.store(std::numeric_limits<uint64_t>::max(),
+                          std::memory_order_relaxed);
+    drainFramesMax_.store(0, std::memory_order_relaxed);
+    writesSinceDrain_.store(0, std::memory_order_relaxed);
+    maxWritesBetweenDrains_.store(0, std::memory_order_relaxed);
+    for (auto& bucket : ringOccupancy_) bucket.store(0, std::memory_order_relaxed);
+    ringOccupancySamples_.store(0, std::memory_order_relaxed);
+    ringHighWater_.store(0, std::memory_order_relaxed);
     playbackStarted_.store(false, std::memory_order_relaxed);
     stopRequested_.store(false, std::memory_order_relaxed);
     transportFailed_.store(false, std::memory_order_relaxed);
@@ -1838,6 +1854,13 @@ void LibusbUacDriver::onCapture(libusb_transfer* xfr) {
         const bool implicit = captureFormat_.implicitFeedback &&
                               format_.feedbackEndpointAddress == 0;
         if (implicit) {
+            // A failed or empty capture packet carries no clock information.
+            // Writing zero here is not a measurement of what the device
+            // consumed, so it is counted as the integrity event it is; the
+            // startup prime refuses to build a packet plan out of these.
+            if (!packetOk) {
+                implicitMetadataInvalid_.fetch_add(1, std::memory_order_relaxed);
+            }
             const uint16_t packetFrames =
                 packetOk ? static_cast<uint16_t>(n / stride) : 0;
             const size_t write =
@@ -2178,6 +2201,11 @@ bool LibusbUacDriver::startIsoPump(bool submit) {
     playbackPacketsPerTransfer_ = userspaceBufferConfig_.packetsPerTransfer != 0
         ? userspaceBufferConfig_.packetsPerTransfer
         : packetsPerTransferForRate(microframesPerSec_);
+    // One transfer's nominal duration, the unit a completion gap is counted in.
+    nominalTransferNs_ = format_.sampleRateHz > 0
+        ? static_cast<int>(static_cast<int64_t>(playbackPacketsPerTransfer_) *
+                           1000000000LL / microframesPerSec_)
+        : 0;
     int baseFrames = format_.sampleRateHz / microframesPerSec_;
     int rateRemainder = format_.sampleRateHz % microframesPerSec_;
     LOGI("iso pump: %d packets/sec (HS=%d, bInterval=%u), "
@@ -2273,6 +2301,13 @@ bool LibusbUacDriver::startIsoPump(bool submit) {
                     if (implicitRead_.compare_exchange_weak(
                             read, read + 1, std::memory_order_acq_rel,
                             std::memory_order_acquire)) {
+                        // An entry of zero frames comes from a capture packet
+                        // that failed or arrived empty, so it carries no clock
+                        // information. Priming a descriptor from it plans a
+                        // zero-length packet and halves the initial geometry:
+                        // four transfers primed 96 frames where the nominal is
+                        // 192. Consume it and take the next valid entry.
+                        if (frames <= 0) continue;
                         xfr->iso_packet_desc[packet].length =
                             frames * frameStride;
                         break;
@@ -2355,6 +2390,9 @@ bool LibusbUacDriver::submitIsoPump() {
     };
     // All initial packet payloads are filled before the first submit.
     const int stride = format_.channels * format_.bytesPerSample;
+    LOGI("iso prime: transfers=%zu exact_initial=%d prime=%d buffered=%d stride=%d",
+         transfers_.size(), exactInitialPacketFrames_, startupPrimeFrames(),
+         bufferedFrames(), stride);
     if (stride <= 0 || startupPrimeFrames() > bufferedFrames()) {
         LOGE("playback submit rejected: stride=%d prime=%d buffered=%d",
              stride, startupPrimeFrames(), bufferedFrames());
@@ -2622,17 +2660,6 @@ void LibusbUacDriver::onIso(libusb_transfer* xfr) {
             completedFrames += static_cast<uint64_t>(
                 xfr->iso_packet_desc[p].length / queuedStride);
     subtractQueued(queuedOutFrames_, completedFrames);
-    // Sampled where the runway shrinks, which is the only place it can reach a
-    // new minimum: a completion removes frames the device has consumed, and
-    // resubmission adds them back.
-    {
-        const uint64_t runway =
-            queuedOutFrames_.load(std::memory_order_acquire);
-        uint64_t low = queuedOutLowWater_.load(std::memory_order_relaxed);
-        while (runway < low &&
-               !queuedOutLowWater_.compare_exchange_weak(
-                   low, runway, std::memory_order_relaxed)) {}
-    }
     if (xfr->status == LIBUSB_TRANSFER_CANCELLED ||
         stopRequested_.load(std::memory_order_acquire)) {
         inflight_.fetch_sub(1, std::memory_order_acq_rel);
@@ -2653,6 +2680,65 @@ void LibusbUacDriver::onIso(libusb_transfer* xfr) {
                 playbackTransferErrors_.fetch_add(1, std::memory_order_relaxed);
             }
         }
+    }
+
+    // Sampled here rather than at the subtraction above: stop() zeroes the
+    // queue on purpose and the cancellations that follow would otherwise
+    // record that zero as if the runway had run dry mid-stream.
+    if (playbackStarted_.load(std::memory_order_acquire)) {
+        const uint64_t now = monotonicNowNs();
+        if (lastCompletionNs_ != 0 && now > lastCompletionNs_) {
+            const uint64_t gap = now - lastCompletionNs_;
+            uint64_t worst = maxCompletionGapNs_.load(std::memory_order_relaxed);
+            while (gap > worst &&
+                   !maxCompletionGapNs_.compare_exchange_weak(
+                       worst, gap, std::memory_order_relaxed)) {}
+            if (nominalTransferNs_ > 0) {
+                // Drain opportunities the gap spans, counted before this
+                // service rather than after it: the ring had to hold the
+                // writes for all of them. Subtracting the completion that
+                // ended the gap undercounts the debt the headroom must absorb.
+                const uint64_t extra =
+                    gap / static_cast<uint64_t>(nominalTransferNs_);
+                uint64_t worstMissing =
+                    maxMissingDrains_.load(std::memory_order_relaxed);
+                while (extra > worstMissing &&
+                       !maxMissingDrains_.compare_exchange_weak(
+                           worstMissing, extra, std::memory_order_relaxed)) {}
+            }
+        }
+        lastCompletionNs_ = now;
+        if (completedFrames > 0) {
+            // Played frames are what the producer may spend.
+            playbackCredit_.fetch_add(static_cast<int64_t>(completedFrames),
+                                      std::memory_order_acq_rel);
+            uint64_t lowest = drainFramesMin_.load(std::memory_order_relaxed);
+            while (completedFrames < lowest &&
+                   !drainFramesMin_.compare_exchange_weak(
+                       lowest, completedFrames, std::memory_order_relaxed)) {}
+            uint64_t highest = drainFramesMax_.load(std::memory_order_relaxed);
+            while (completedFrames > highest &&
+                   !drainFramesMax_.compare_exchange_weak(
+                       highest, completedFrames, std::memory_order_relaxed)) {}
+        }
+        const uint64_t runway =
+            queuedOutFrames_.load(std::memory_order_acquire);
+        uint64_t low = queuedOutLowWater_.load(std::memory_order_relaxed);
+        while (runway < low &&
+               !queuedOutLowWater_.compare_exchange_weak(
+                   low, runway, std::memory_order_relaxed)) {}
+        // Occupancy right after a drain, which is where the sawtooth bottoms
+        // out; the peak is recorded by the writer.
+        const uint64_t occupancy = static_cast<uint64_t>(std::max(0, bufferedFrames()));
+        const int bucket = std::min<int>(
+            kOccupancyBuckets - 1,
+            static_cast<int>(occupancy / kOccupancyBucketFrames));
+        ringOccupancy_[bucket].fetch_add(1, std::memory_order_relaxed);
+        ringOccupancySamples_.fetch_add(1, std::memory_order_relaxed);
+        uint64_t ringLow = ringLowWater_.load(std::memory_order_relaxed);
+        while (occupancy < ringLow &&
+               !ringLowWater_.compare_exchange_weak(
+                   ringLow, occupancy, std::memory_order_relaxed)) {}
     }
 
     const bool implicit = captureActive_.load(std::memory_order_acquire) &&
@@ -2773,6 +2859,7 @@ void LibusbUacDriver::inspectTransferContinuity(
                 std::fabs(static_cast<float>(value) -
                           static_cast<float>(lastTransferSample_)) / kScale;
             if (step > threshold) {
+                transferDiscontinuities_.fetch_add(1, std::memory_order_relaxed);
                 flightRecorder_.record(
                     PacketFlightRecorder::Event::TransferDiscontinuity,
                     monotonicNowNs(),
@@ -2794,6 +2881,12 @@ int LibusbUacDriver::drainRing(uint8_t* dst, int bytes) {
     size_t available = head - tail;
     int n = static_cast<int>(std::min<size_t>(available, static_cast<size_t>(bytes)));
     if (n > 0) {
+        // Cleared here rather than in the completion callback: the deferred
+        // path drains the ring from onCapture as well, so a reset tied to
+        // completions counted writes between callbacks instead of between
+        // drains - and five quanta of 64 cannot fit under a 296 frame ceiling,
+        // which is how the miscount showed itself.
+        writesSinceDrain_.store(0, std::memory_order_relaxed);
         size_t off = tail & ringMask_;
         size_t first = std::min<size_t>(n, ring_.size() - off);
         std::memcpy(dst, ring_.data() + off, first);
@@ -2908,6 +3001,16 @@ void LibusbUacDriver::commitPlaybackWrite(
     ringHead_.store(
         region.producerCursor + written, std::memory_order_release);
     writtenFrames_.fetch_add(region.frames, std::memory_order_acq_rel);
+    // The sawtooth peaks right after a write, so this is where the high water
+    // belongs; the completion path records the trough.
+    if (playbackStarted_.load(std::memory_order_acquire)) {
+        const uint64_t occupancy =
+            static_cast<uint64_t>(std::max(0, bufferedFrames()));
+        uint64_t high = ringHighWater_.load(std::memory_order_relaxed);
+        while (occupancy > high &&
+               !ringHighWater_.compare_exchange_weak(
+                   high, occupancy, std::memory_order_relaxed)) {}
+    }
 }
 
 int LibusbUacDriver::writePcm(const uint8_t* data, int frames) {
@@ -3045,6 +3148,27 @@ int LibusbUacDriver::writableFrames() const {
                                 static_cast<size_t>(frameStride);
     const size_t logicalFree = queuedFrames < frameLimit ? frameLimit - queuedFrames : 0;
     return static_cast<int>(std::min(physicalFree, logicalFree));
+}
+
+bool LibusbUacDriver::waitForPlaybackCreditUntil(
+        int frames, std::chrono::steady_clock::time_point deadline) noexcept {
+    if (frames <= 0) return true;
+    if (!playbackStarted_.load(std::memory_order_acquire)) return true;
+    // Completions grant the credit and signal this channel, so waiting here is
+    // waiting for the device to consume - which is exactly what paces the
+    // producer. A deadline still applies: a device that stops consuming is a
+    // transport failure, not a reason to block the render thread forever.
+    const WakeChannel::Registration waiting(playbackWake_);
+    while (playbackCredit_.load(std::memory_order_acquire) < frames &&
+           streaming_.load(std::memory_order_acquire) &&
+           !transportFailed_.load(std::memory_order_acquire)) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) break;
+        if (!playbackWake_.poll(static_cast<int>(remaining))) break;
+    }
+    return playbackCredit_.load(std::memory_order_acquire) >= frames;
 }
 
 bool LibusbUacDriver::waitForWritableFrames(int frames, int timeoutMs) const {
