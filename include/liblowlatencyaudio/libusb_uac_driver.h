@@ -379,6 +379,10 @@ public:
     void resetEnvelopeMetrics() noexcept {
         lastCompletionNs_ = 0;
         maxCompletionGapNs_.store(0, std::memory_order_relaxed);
+        serviceGapCount_.store(0, std::memory_order_relaxed);
+        worstGapInflight_.store(-1, std::memory_order_relaxed);
+        worstGapPending_.store(-1, std::memory_order_relaxed);
+        worstGapRing_.store(-1, std::memory_order_relaxed);
         maxMissingDrains_.store(0, std::memory_order_relaxed);
         drainFramesMin_.store(std::numeric_limits<uint64_t>::max(),
                               std::memory_order_relaxed);
@@ -414,6 +418,18 @@ public:
     // at once instead of waiting for the device to play it back a packet at a
     // time. The overshoot stays bounded by the reserve, which is what the
     // startup case needed.
+    // Deliberate stall injected into USB event servicing, in microseconds,
+    // fired once when armed. The natural loss vanished when the machine was
+    // quietened, so without a reproducible stimulus nothing can be shown to
+    // fix it - a passing test would only mean the disturbance was absent.
+    // Separate from a render stall because the two produce different symptoms
+    // and a generic CPU load cannot tell them apart.
+    void injectServiceStallUs(int microseconds) noexcept {
+        serviceStallUs_.store(microseconds, std::memory_order_relaxed);
+    }
+    uint64_t serviceStallsFired() const noexcept {
+        return serviceStallsFired_.load(std::memory_order_relaxed);
+    }
     void setPlaybackCreditReserve(int frames) noexcept {
         playbackCreditReserve_.store(frames < 0 ? 0 : frames,
                                      std::memory_order_relaxed);
@@ -439,6 +455,14 @@ public:
     }
     int64_t playbackCreditFrames() const noexcept {
         return playbackCredit_.load(std::memory_order_relaxed);
+    }
+    void worstServiceGapState(int* inflight, int* pending, int* ring) const noexcept {
+        if (inflight) *inflight = worstGapInflight_.load(std::memory_order_relaxed);
+        if (pending) *pending = worstGapPending_.load(std::memory_order_relaxed);
+        if (ring) *ring = worstGapRing_.load(std::memory_order_relaxed);
+    }
+    uint64_t serviceGapCount() const noexcept {
+        return serviceGapCount_.load(std::memory_order_relaxed);
     }
     uint64_t maxCompletionGapNs() const noexcept {
         return maxCompletionGapNs_.load(std::memory_order_relaxed);
@@ -781,9 +805,23 @@ private:
     // what a deeper prime or a startup-only headroom would both cost.
     std::atomic<int64_t> playbackCredit_{0};
     std::atomic<int> playbackCreditReserve_{0};
+    std::atomic<int> serviceStallUs_{0};
+    std::atomic<uint64_t> serviceStallsFired_{0};
     uint64_t lastCompletionNs_ = 0;
     int nominalTransferNs_ = 0;
     std::atomic<uint64_t> maxCompletionGapNs_{0};
+    // Completion gaps beyond twice the nominal transfer period. The maximum
+    // says how bad the worst pause was; this says how often the bus stopped
+    // being serviced at all, which is what separates a quiet run from a busy
+    // one and what a configuration comparison actually needs.
+    std::atomic<uint64_t> serviceGapCount_{0};
+    // The pipeline as it stood at the worst service pause. Counting the pauses
+    // says how often the bus stops; this says what was outstanding when it
+    // did, which is the difference between "libusb was not scheduled" and
+    // "the device stopped answering".
+    std::atomic<int> worstGapInflight_{-1};
+    std::atomic<int> worstGapPending_{-1};
+    std::atomic<int> worstGapRing_{-1};
     std::atomic<uint64_t> maxMissingDrains_{0};
     std::atomic<uint64_t> drainFramesMin_{std::numeric_limits<uint64_t>::max()};
     std::atomic<uint64_t> drainFramesMax_{0};

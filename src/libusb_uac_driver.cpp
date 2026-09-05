@@ -1336,6 +1336,10 @@ bool LibusbUacDriver::start(int sampleRateHz, int bitsPerSample, int channels,
     playbackCredit_.store(0, std::memory_order_relaxed);
     lastCompletionNs_ = 0;
     maxCompletionGapNs_.store(0, std::memory_order_relaxed);
+    serviceGapCount_.store(0, std::memory_order_relaxed);
+    worstGapInflight_.store(-1, std::memory_order_relaxed);
+    worstGapPending_.store(-1, std::memory_order_relaxed);
+    worstGapRing_.store(-1, std::memory_order_relaxed);
     maxMissingDrains_.store(0, std::memory_order_relaxed);
     drainFramesMin_.store(std::numeric_limits<uint64_t>::max(),
                           std::memory_order_relaxed);
@@ -2685,14 +2689,38 @@ void LibusbUacDriver::onIso(libusb_transfer* xfr) {
     // Sampled here rather than at the subtraction above: stop() zeroes the
     // queue on purpose and the cancellations that follow would otherwise
     // record that zero as if the runway had run dry mid-stream.
+    // Fires once per arming, inside the completion path, which is precisely
+    // where a real service pause hurts: completions stop being processed, the
+    // ring stops draining, and capture URBs are not resubmitted.
+    if (const int stallUs = serviceStallUs_.exchange(0, std::memory_order_relaxed);
+        stallUs > 0) {
+        const uint64_t until = monotonicNowNs() +
+            static_cast<uint64_t>(stallUs) * 1000ull;
+        while (monotonicNowNs() < until) {}
+        serviceStallsFired_.fetch_add(1, std::memory_order_relaxed);
+    }
     if (playbackStarted_.load(std::memory_order_acquire)) {
         const uint64_t now = monotonicNowNs();
         if (lastCompletionNs_ != 0 && now > lastCompletionNs_) {
             const uint64_t gap = now - lastCompletionNs_;
             uint64_t worst = maxCompletionGapNs_.load(std::memory_order_relaxed);
+            const bool isWorst = gap > worst;
             while (gap > worst &&
                    !maxCompletionGapNs_.compare_exchange_weak(
                        worst, gap, std::memory_order_relaxed)) {}
+            if (isWorst) {
+                worstGapInflight_.store(
+                    inflight_.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+                worstGapPending_.store(
+                    static_cast<int>(pendingImplicitCount_),
+                    std::memory_order_relaxed);
+                worstGapRing_.store(bufferedFrames(), std::memory_order_relaxed);
+            }
+            if (nominalTransferNs_ > 0 &&
+                gap > 2ull * static_cast<uint64_t>(nominalTransferNs_)) {
+                serviceGapCount_.fetch_add(1, std::memory_order_relaxed);
+            }
             if (nominalTransferNs_ > 0) {
                 // Drain opportunities the gap spans, counted before this
                 // service rather than after it: the ring had to hold the

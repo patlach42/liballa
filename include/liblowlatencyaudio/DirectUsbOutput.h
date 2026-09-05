@@ -364,6 +364,12 @@ public:
     bool takePlaybackCredit(int frames) noexcept {
         return driver_.takePlaybackCredit(frames);
     }
+    void injectServiceStallUs(int microseconds) noexcept {
+        driver_.injectServiceStallUs(microseconds);
+    }
+    uint64_t serviceStallsFired() const noexcept {
+        return driver_.serviceStallsFired();
+    }
     void setPlaybackCreditReserve(int frames) noexcept {
         driver_.setPlaybackCreditReserve(frames);
     }
@@ -422,6 +428,12 @@ public:
     }
     uint64_t maxCompletionGapNs() const noexcept {
         return driver_.maxCompletionGapNs();
+    }
+    uint64_t serviceGapCount() const noexcept {
+        return driver_.serviceGapCount();
+    }
+    void worstServiceGapState(int* inflight, int* pending, int* ring) const noexcept {
+        driver_.worstServiceGapState(inflight, pending, ring);
     }
     uint64_t maxMissingDrains() const noexcept { return driver_.maxMissingDrains(); }
     uint64_t drainFramesMin() const noexcept { return driver_.drainFramesMin(); }
