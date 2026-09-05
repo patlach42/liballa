@@ -193,8 +193,21 @@ public:
     // Called only from the dedicated render thread. Admits one complete
     // quantum without waiting. A full or partially writable ring drops the
     // newest quantum; no partial commit is ever published.
+    // Publishes a block whose credit was already spent on an earlier attempt.
+    // Charging it again would bill the same audio twice, and at startup the
+    // second charge is the one that fails - which loses the very block the
+    // holding slot exists to save.
+    bool submitHeldQuantum(const float* left, const float* right,
+                           int frames) noexcept {
+        return submitQuantum(left, right, frames, /*chargeCredit=*/false);
+    }
     bool submitWholeQuantum(const float* left, const float* right,
                             int frames) noexcept {
+        return submitQuantum(left, right, frames, /*chargeCredit=*/true);
+    }
+
+    bool submitQuantum(const float* left, const float* right, int frames,
+                       bool chargeCredit) noexcept {
         if (!left || !right || frames <= 0 ||
             frames > kMaxFramesPerWrite ||
             !accepting_.load(std::memory_order_acquire)) {
@@ -222,7 +235,13 @@ public:
             // for one. Measured, that drove the ring to four frames, the OUT
             // queue to zero and PCM deferrals to forty three thousand. The
             // producer now waits for room instead, which loses nothing.
+            // Under the credit policy the frames are spent here, with the
+            // publish and only on success: spending them earlier and refusing
+            // the write afterwards destroyed the right to write permanently.
             if (region.frames == frames &&
+                (!chargeCredit ||
+                 admissionPolicy_.load(std::memory_order_relaxed) != 1 ||
+                 driver_.takePlaybackCredit(frames)) &&
                 packPlaybackRegionForFormat(region, left, right)) {
                 driver_.commitPlaybackWrite(region);
                 driver_.noteQuantumWritten();
@@ -260,14 +279,29 @@ public:
         frames = std::min(frames, kMaxFramesPerWrite);
         for (int channel = 0; channel < destinationChannels; ++channel) {
             if (!destinations[channel]) return 0;
-            std::memset(destinations[channel], 0,
-                        static_cast<size_t>(frames) * sizeof(float));
         }
         const auto region = driver_.prepareCaptureRead(frames);
         const auto& format = driver_.currentCaptureFormat();
         const int available = std::max(0, format.channels);
         const int decodedFrames = std::max(0, std::min(region.frames, frames));
         const int decodeChannels = std::min(destinationChannels, available);
+        // A short read is not a block with a quiet tail. The destinations used
+        // to be zero-filled first, so a partial region handed the graph real
+        // audio followed by invented silence - the capture-side twin of the
+        // padding removed from playback, and just as inaudible in the counters.
+        // Publish whole quanta or nothing.
+        if (decodedFrames < frames || decodeChannels <= 0) {
+            driver_.commitCaptureRead(region);
+            capturePartialReads_.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+        // Channels the format does not carry are silent because they do not
+        // exist, which is not the same as inventing a tail on a channel that
+        // does. Only the former is filled.
+        for (int channel = decodeChannels; channel < destinationChannels; ++channel) {
+            std::memset(destinations[channel], 0,
+                        static_cast<size_t>(frames) * sizeof(float));
+        }
         for (int channel = 0; channel < decodeChannels; ++channel) {
             const int sampleOffset = channel * format.bytesPerSample +
                 (format.bytesPerSample - (format.bitsPerSample + 7) / 8);
@@ -304,6 +338,18 @@ public:
             int frames, std::chrono::steady_clock::time_point deadline) const noexcept {
         return driver_.waitForCaptureFramesUntil(frames, deadline);
     }
+    // Admission policy, selectable at run time so the two can be compared in
+    // one build: 0 waits for room, 1 paces the producer by played frames.
+    // Comparing them by installing different builds would confound the policy
+    // with ART, dexopt and launch state, which is the mistake this project
+    // already made once today.
+    void setAdmissionPolicy(int policy) noexcept {
+        admissionPolicy_.store(policy, std::memory_order_relaxed);
+    }
+    int admissionPolicy() const noexcept {
+        return admissionPolicy_.load(std::memory_order_relaxed);
+    }
+
     // Paces the producer to the device: a quantum may be rendered only against
     // frames the device has actually played.
     bool waitForPlaybackCreditUntil(
@@ -312,6 +358,12 @@ public:
     }
     bool takePlaybackCredit(int frames) noexcept {
         return driver_.takePlaybackCredit(frames);
+    }
+    void setPlaybackCreditReserve(int frames) noexcept {
+        driver_.setPlaybackCreditReserve(frames);
+    }
+    int playbackCreditReserve() const noexcept {
+        return driver_.playbackCreditReserve();
     }
     int64_t playbackCreditFrames() const noexcept {
         return driver_.playbackCreditFrames();
@@ -469,6 +521,9 @@ public:
     }
     int captureInspectChannel() const noexcept {
         return captureInspectChannel_.load(std::memory_order_relaxed);
+    }
+    uint64_t capturePartialReadCount() const noexcept {
+        return capturePartialReads_.load(std::memory_order_relaxed);
     }
     uint64_t captureInspectSkips() const noexcept {
         return captureInspectSkips_.load(std::memory_order_relaxed);
@@ -882,6 +937,7 @@ private:
     std::atomic<bool> streaming_{false};
     std::atomic<uint32_t> activeWriters_{0};
     // Smallest writable-minus-quantum seen; negative means a refusal.
+    std::atomic<int> admissionPolicy_{0};
     std::atomic<int> minAdmissionMargin_{std::numeric_limits<int>::max()};
     std::atomic<uint64_t> playbackQuantumDrops_{0};
     std::atomic<float> discontinuityThreshold_{0.0f};
@@ -897,6 +953,8 @@ private:
     std::atomic<int> captureInspectChannel_{0};
     // Blocks left uninspected because the requested channel was not decoded.
     std::atomic<uint64_t> captureInspectSkips_{0};
+    // Capture reads refused because the region was short of a whole quantum.
+    std::atomic<uint64_t> capturePartialReads_{0};
     std::atomic<float> captureDiscontinuityThreshold_{0.0f};
     std::atomic<float> captureModulationThreshold_{0.0f};
     // 4096 frames is about 37 periods of a 440 Hz tone at 48 kHz, enough for

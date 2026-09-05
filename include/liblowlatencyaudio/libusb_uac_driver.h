@@ -402,11 +402,29 @@ public:
         int frames, std::chrono::steady_clock::time_point deadline) const;
     bool waitForPlaybackCreditUntil(
         int frames, std::chrono::steady_clock::time_point deadline) noexcept;
+    // How far the producer may run ahead of the device, in frames. Zero is
+    // strict credit: nothing may be published that the device has not already
+    // played, which forbids the producer from holding any lead at all - and a
+    // buffer is precisely a lead. With a reserve the credit may go negative,
+    // down to -reserve, so a producer that was preempted can refill the ring
+    // at once instead of waiting for the device to play it back a packet at a
+    // time. The overshoot stays bounded by the reserve, which is what the
+    // startup case needed.
+    void setPlaybackCreditReserve(int frames) noexcept {
+        playbackCreditReserve_.store(frames < 0 ? 0 : frames,
+                                     std::memory_order_relaxed);
+    }
+    int playbackCreditReserve() const noexcept {
+        return playbackCreditReserve_.load(std::memory_order_relaxed);
+    }
     bool takePlaybackCredit(int frames) noexcept {
         if (frames <= 0) return true;
         if (!playbackStarted_.load(std::memory_order_acquire)) return true;
+        const int64_t floor =
+            -static_cast<int64_t>(playbackCreditReserve_.load(
+                std::memory_order_relaxed));
         int64_t credit = playbackCredit_.load(std::memory_order_relaxed);
-        while (credit >= frames) {
+        while (credit - frames >= floor) {
             if (playbackCredit_.compare_exchange_weak(
                     credit, credit - frames, std::memory_order_acq_rel,
                     std::memory_order_relaxed)) {
@@ -758,6 +776,7 @@ private:
     // credit removes the overshoot without adding a frame of latency, which is
     // what a deeper prime or a startup-only headroom would both cost.
     std::atomic<int64_t> playbackCredit_{0};
+    std::atomic<int> playbackCreditReserve_{0};
     uint64_t lastCompletionNs_ = 0;
     int nominalTransferNs_ = 0;
     std::atomic<uint64_t> maxCompletionGapNs_{0};

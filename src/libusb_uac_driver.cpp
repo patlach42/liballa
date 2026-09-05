@@ -3158,8 +3158,10 @@ bool LibusbUacDriver::waitForPlaybackCreditUntil(
     // waiting for the device to consume - which is exactly what paces the
     // producer. A deadline still applies: a device that stops consuming is a
     // transport failure, not a reason to block the render thread forever.
+    const int64_t floor =
+        -static_cast<int64_t>(playbackCreditReserve_.load(std::memory_order_relaxed));
     const WakeChannel::Registration waiting(playbackWake_);
-    while (playbackCredit_.load(std::memory_order_acquire) < frames &&
+    while (playbackCredit_.load(std::memory_order_acquire) - frames < floor &&
            streaming_.load(std::memory_order_acquire) &&
            !transportFailed_.load(std::memory_order_acquire)) {
         const auto remaining =
@@ -3168,7 +3170,7 @@ bool LibusbUacDriver::waitForPlaybackCreditUntil(
         if (remaining <= 0) break;
         if (!playbackWake_.poll(static_cast<int>(remaining))) break;
     }
-    return playbackCredit_.load(std::memory_order_acquire) >= frames;
+    return playbackCredit_.load(std::memory_order_acquire) - frames >= floor;
 }
 
 bool LibusbUacDriver::waitForWritableFramesUntil(

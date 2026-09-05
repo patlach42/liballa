@@ -399,6 +399,36 @@ TEST(UsbDriverRing, PlaybackCreditPacesTheProducerToPlayedFrames) {
     EXPECT_EQ(driver.playbackCreditFrames(), before);
 }
 
+TEST(UsbDriverRing, CreditReserveLetsTheProducerHoldABoundedLead) {
+    monotrypt::usb::LibusbUacDriver driver;
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
+    monotrypt::usb::UsbDriverTestAccess::playbackStarted(driver, true);
+
+    constexpr int kQuantum = 64;
+    // Strict credit forbids any lead at all, which is the same as forbidding a
+    // buffer: nothing may be published before the device has played it.
+    EXPECT_FALSE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+
+    // A reserve is exactly how far ahead the producer may run. Two quanta of
+    // reserve permit two quanta before anything has played, and no more.
+    driver.setPlaybackCreditReserve(2 * kQuantum);
+    EXPECT_TRUE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    EXPECT_TRUE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    EXPECT_FALSE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    EXPECT_EQ(driver.playbackCreditFrames(), -2 * kQuantum);
+
+    // Played frames repay the debt, and the lead becomes available again: a
+    // producer that was late refills at once instead of waiting for the device
+    // to hand back one packet at a time.
+    for (int transfer = 0; transfer < 3; ++transfer) {
+        monotrypt::usb::UsbDriverTestAccess::grantCredit(driver, 24);
+    }
+    EXPECT_EQ(driver.playbackCreditFrames(), -56);
+    EXPECT_TRUE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    EXPECT_EQ(driver.playbackCreditFrames(), -120);
+    EXPECT_FALSE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+}
+
 TEST(UsbDriverRing, DrainStarvationShortensInsteadOfPaddingAndCountsUnderrun) {
     monotrypt::usb::LibusbUacDriver driver;
     monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
