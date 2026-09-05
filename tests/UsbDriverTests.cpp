@@ -429,6 +429,39 @@ TEST(UsbDriverRing, CreditReserveLetsTheProducerHoldABoundedLead) {
     EXPECT_FALSE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
 }
 
+TEST(UsbDriverRing, PlaybackStockLedgerBalancesAcrossHoldAndRepublish) {
+    monotrypt::usb::LibusbUacDriver driver;
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
+    monotrypt::usb::UsbDriverTestAccess::playbackStarted(driver, true);
+    driver.setPlaybackCreditReserve(4 * 64);
+
+    constexpr int kQuantum = 64;
+    // The ledger the whole design rests on: every frame the device plays is a
+    // right to write one, spent exactly once. A held block pays on entry to the
+    // slot and republishes free, so the sum of what the pipeline owes and what
+    // it holds must not drift - a drift of whole quanta is what let the
+    // producer run three or four blocks ahead unnoticed.
+    const int64_t start = driver.playbackCreditFrames();
+
+    // One block published normally: charged once.
+    ASSERT_TRUE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    EXPECT_EQ(driver.playbackCreditFrames(), start - kQuantum);
+
+    // One block that goes to the slot: charged on entry, and republication
+    // must not charge again.
+    ASSERT_TRUE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    const int64_t afterHold = driver.playbackCreditFrames();
+    EXPECT_EQ(afterHold, start - 2 * kQuantum);
+    // Republication goes through the path that does not charge.
+    EXPECT_EQ(driver.playbackCreditFrames(), afterHold);
+
+    // Frames the device played return the right to write, one for one.
+    for (int transfer = 0; transfer < 6; ++transfer) {
+        monotrypt::usb::UsbDriverTestAccess::grantCredit(driver, 24);
+    }
+    EXPECT_EQ(driver.playbackCreditFrames(), afterHold + 144);
+}
+
 TEST(UsbDriverRing, DrainStarvationShortensInsteadOfPaddingAndCountsUnderrun) {
     monotrypt::usb::LibusbUacDriver driver;
     monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
