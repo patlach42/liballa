@@ -188,6 +188,17 @@ public:
 #endif
     }
 
+    // APerformanceHint_setThreads landed in API 34; older platforms resolve
+    // the symbol to null and can never rebind, which is a different answer
+    // from a rebind the platform actively refused.
+    bool canSetThreads() const noexcept {
+#if defined(__ANDROID__)
+        return session_ != nullptr && setThreads_ != nullptr;
+#else
+        return false;
+#endif
+    }
+
     bool setThreads(const int32_t* tids, size_t count) noexcept {
 #if defined(__ANDROID__)
         return session_ && setThreads_ && tids && count > 0 &&
