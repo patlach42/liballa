@@ -128,6 +128,11 @@ public:
     int startupPrimeFrames() const noexcept {
         return driver_.startupPrimeFrames();
     }
+    // Exposed so a caller that loses a quantum can record where it happened
+    // with the pipeline state that produced it.
+    monotrypt::usb::PacketFlightRecorder& flightRecorder() noexcept {
+        return driver_.flightRecorder();
+    }
     uint64_t queuedOutFrames() const noexcept {
         return driver_.queuedOutFrames();
     }

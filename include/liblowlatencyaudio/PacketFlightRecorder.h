@@ -116,6 +116,14 @@ public:
         // `a` is the deviation from the running level scaled by 10000, `b` the
         // level itself scaled by 10000, and ringFrames the reference level.
         CaptureModulation = 12,
+        // A rendered quantum that reached neither the ring nor the holding
+        // slot, so its audio was never played. Distinct from QuantumRefused,
+        // which merely says admission declined this instant: with the holding
+        // slot a refusal is usually delivered a cycle later, and only this
+        // event means frames were actually lost. `a` carries the frames, `b`
+        // whether a block was already held, and the occupancy fields say what
+        // the pipeline looked like when it happened.
+        QuantumLost = 13,
     };
 
     struct Record {
@@ -191,7 +199,8 @@ public:
                maskOf(Event::SignalDiscontinuity) |
                maskOf(Event::TransferDiscontinuity) |
                maskOf(Event::CaptureDiscontinuity) |
-               maskOf(Event::CaptureModulation);
+               maskOf(Event::CaptureModulation) |
+               maskOf(Event::QuantumLost);
     }
 
     // Freeze the buffer the first time `trigger` is recorded, the way an

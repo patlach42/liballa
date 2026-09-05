@@ -3173,11 +3173,34 @@ bool LibusbUacDriver::waitForPlaybackCreditUntil(
     return playbackCredit_.load(std::memory_order_acquire) - frames >= floor;
 }
 
+int LibusbUacDriver::writableToTargetFrames() const {
+    const int frameStride = format_.channels * format_.bytesPerSample;
+    if (frameStride <= 0) return 0;
+    const size_t head = ringHead_.load(std::memory_order_relaxed);
+    const size_t tail = ringTail_.load(std::memory_order_acquire);
+    const size_t queued = (head - tail) / static_cast<size_t>(frameStride);
+    // Room measured against the target rather than the admission ceiling.
+    // Admission refuses at target + headroom, so a producer that only stops
+    // when refused settles just under the ceiling and the headroom - meant to
+    // absorb the sawtooth - becomes the working level instead. Measured, the
+    // ring sat at 244-276 against a target of 256 and a ceiling of 296, so a
+    // single late drain exhausted it and a held block had nowhere to return.
+    const int target = playbackStarted_.load(std::memory_order_acquire)
+        ? playbackTargetFrames_.load(std::memory_order_acquire)
+        : startupPrimeFrames_.load(std::memory_order_acquire);
+    if (target <= 0) return writableFrames();
+    const size_t limit = static_cast<size_t>(target);
+    const size_t logicalFree = queued < limit ? limit - queued : 0;
+    const size_t physicalFree =
+        (ring_.size() - (head - tail)) / static_cast<size_t>(frameStride);
+    return static_cast<int>(std::min(physicalFree, logicalFree));
+}
+
 bool LibusbUacDriver::waitForWritableFramesUntil(
         int frames, std::chrono::steady_clock::time_point deadline) const {
     if (frames <= 0) return true;
     const WakeChannel::Registration waiting(playbackWake_);
-    while (writableFrames() < frames &&
+    while (writableToTargetFrames() < frames &&
            streaming_.load(std::memory_order_acquire) &&
            !transportFailed_.load(std::memory_order_acquire)) {
         const auto remaining =
@@ -3186,6 +3209,9 @@ bool LibusbUacDriver::waitForWritableFramesUntil(
         if (remaining <= 0) break;
         if (!playbackWake_.poll(static_cast<int>(remaining))) break;
     }
+    // Falls back to the ceiling on expiry: the producer prefers to sit at the
+    // target, but when the deadline is gone publishing into the headroom beats
+    // losing the block.
     return writableFrames() >= frames;
 }
 

@@ -398,6 +398,10 @@ public:
     // Credit is granted by played frames and spent by published quanta. Before
     // playback starts there is nothing to pace against: the initial prime is
     // the stock the stream begins with, so it is always admitted.
+    // Room before the target, as distinct from room before the admission
+    // ceiling: the difference is the headroom, which is a cushion and not a
+    // place for the producer to live.
+    int writableToTargetFrames() const;
     bool waitForWritableFramesUntil(
         int frames, std::chrono::steady_clock::time_point deadline) const;
     bool waitForPlaybackCreditUntil(
