@@ -519,6 +519,7 @@ public:
         capturePrevious_ = 0.0f;
         capturePeak_ = 0.0f;
         captureSeeded_ = false;
+        captureRampWindows_ = 0;
         levelSum_ = 0.0;
         levelCount_ = 0;
         levelWindows_ = 0;
@@ -671,11 +672,24 @@ private:
             // Arming is recorded separately from firing: a run where the loop
             // was silent produces no events for the same reason a clean run
             // does, and only this flag tells the two apart.
-            if (captureSeeded_ && capturePeak_ > 0.02f) {
+            // Arming needs a level worth judging, and the level has to have
+            // settled. During ramp-up the peak is still climbing, so an
+            // ordinary step measured against it looks enormous: every run
+            // reported two breaks at 0.23 seconds with the peak at 0.03 to
+            // 0.06, in every configuration, which is the detector describing
+            // its own reference rather than the audio. The same mistake was
+            // fixed in the modulation detector with a warmup, and this is that
+            // fix applied where it was missed.
+            const bool levelUsable = captureSeeded_ && capturePeak_ > 0.02f;
+            if (levelUsable && captureRampWindows_ <= kCaptureRampWindows) {
+                ++captureRampWindows_;
+            }
+            const bool settled =
+                levelUsable && captureRampWindows_ > kCaptureRampWindows;
+            if (settled) {
                 captureDetectorArmed_.store(true, std::memory_order_relaxed);
             }
-            if (captureSeeded_ && capturePeak_ > 0.02f &&
-                step > threshold * capturePeak_) {
+            if (settled && step > threshold * capturePeak_) {
                 captureDiscontinuities_.fetch_add(1, std::memory_order_relaxed);
                 driver_.flightRecorder().record(
                     monotrypt::usb::PacketFlightRecorder::Event::
@@ -955,6 +969,11 @@ private:
     // True once the capture detector has seen a level worth judging. Without
     // it a silent loopback reads exactly like a clean one.
     std::atomic<bool> captureDetectorArmed_{false};
+    // Frames of settling before the capture detector judges anything. A
+    // tenth of a second at 48 kHz: long enough for the peak to stop chasing
+    // the signal, short enough to miss nothing real.
+    static constexpr int kCaptureRampWindows = 4800;
+    int captureRampWindows_ = 0;
     std::atomic<int> captureInspectChannel_{0};
     // Blocks left uninspected because the requested channel was not decoded.
     std::atomic<uint64_t> captureInspectSkips_{0};
