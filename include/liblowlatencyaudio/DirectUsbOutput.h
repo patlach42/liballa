@@ -485,6 +485,21 @@ public:
     }
     long writtenFrames() const noexcept { return driver_.writtenFrames(); }
     long playedFrames() const noexcept { return driver_.playedFrames(); }
+    void setMeasureServiceRunqueue(bool enabled) noexcept {
+        driver_.setMeasureServiceRunqueue(enabled);
+    }
+    uint64_t worstMultiCollectSpanNs() const noexcept {
+        return driver_.worstMultiCollectSpanNs();
+    }
+    uint64_t worstMultiCollectRunqueueNs() const noexcept {
+        return driver_.worstMultiCollectRunqueueNs();
+    }
+    uint32_t maxCallbacksPerPoll() const noexcept {
+        return driver_.maxCallbacksPerPoll();
+    }
+    uint64_t worstServiceOffCpuNs() const noexcept {
+        return driver_.worstServiceOffCpuNs();
+    }
     int32_t eventThreadTid() const noexcept {
         return driver_.eventThreadTid();
     }

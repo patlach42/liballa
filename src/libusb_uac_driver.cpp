@@ -1658,19 +1658,7 @@ bool LibusbUacDriver::startDuplex(int sampleRateHz, int bitsPerSample,
             // Capture completions provide the packet clock. Drive them before
             // submitting OUT transfers, then require enough metadata to size
             // every initially queued packet without a nominal fallback.
-            eventThread_ = std::thread([this]() {
-                eventThreadTid_.store(
-                    static_cast<int32_t>(guitarrackcraft::getTid()),
-                    std::memory_order_release);
-                eventThreadUrgentAudio_.store(
-                    guitarrackcraft::setCurrentThreadUrgentAudio("UsbIsoEvents"),
-                    std::memory_order_release);
-                while (!stopRequested_.load(std::memory_order_acquire)) {
-                    timeval tv{0, 100000};
-                    libusb_handle_events_timeout(ctx_, &tv);
-                }
-                eventThreadTid_.store(0, std::memory_order_release);
-            });
+            eventThread_ = std::thread([this]() { runEventLoop(); });
             const int startupPacketsPerSecond = packetsPerSecondForInterval(
                 format_.isHighSpeed, format_.bInterval);
             const int startupPacketsPerTransfer =
@@ -2162,21 +2150,105 @@ void LibusbUacDriver::stop() {
 
 // --- Iso pump ---------------------------------------------------------
 
+namespace {
+
+// The servicing thread's own cumulative runqueue wait, from
+// /proc/self/task/<tid>/schedstat. Opened once and read with pread, and only
+// while a measurement asks for it: this is a procfs read on the thread whose
+// timeliness is the subject, so it is off by default.
+class RunqueueWaitFd {
+public:
+    void openForCurrentThread() noexcept {
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/self/task/%d/schedstat",
+                      static_cast<int>(guitarrackcraft::getTid()));
+        fd_ = ::open(path, O_RDONLY | O_CLOEXEC);
+    }
+    ~RunqueueWaitFd() { if (fd_ >= 0) ::close(fd_); }
+    uint64_t waitNs() const noexcept {
+        if (fd_ < 0) return 0;
+        char buf[96];
+        const ssize_t n = ::pread(fd_, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) return 0;
+        buf[n] = '\0';
+        const char* p = buf;
+        while (*p == ' ') ++p;
+        while (*p >= '0' && *p <= '9') ++p;
+        while (*p == ' ') ++p;
+        uint64_t wait = 0;
+        if (!(*p >= '0' && *p <= '9')) return 0;
+        while (*p >= '0' && *p <= '9') {
+            wait = wait * 10 + static_cast<uint64_t>(*p - '0');
+            ++p;
+        }
+        return wait;
+    }
+
+private:
+    int fd_ = -1;
+};
+
+}  // namespace
+
+// One event loop, called from both places a servicing thread is started. They
+// were separate copies of the same body, which is how the first attempt at
+// instrumenting it measured the thread this device does not use.
+void LibusbUacDriver::runEventLoop() {
+    eventThreadTid_.store(static_cast<int32_t>(guitarrackcraft::getTid()),
+                          std::memory_order_release);
+    eventThreadUrgentAudio_.store(
+        guitarrackcraft::setCurrentThreadUrgentAudio(
+            "UsbIsoEvents", guitarrackcraft::AudioCpuRole::Service),
+        std::memory_order_release);
+    RunqueueWaitFd runqueue;
+    const bool measureRunqueue =
+        measureServiceRunqueue_.load(std::memory_order_relaxed);
+    if (measureRunqueue) runqueue.openForCurrentThread();
+    while (!stopRequested_.load(std::memory_order_acquire)) {
+        timeval tv{0, 100000};
+        callbacksThisPoll_.store(0, std::memory_order_relaxed);
+        const uint64_t runqueueBefore = measureRunqueue ? runqueue.waitNs() : 0;
+        const auto pollBegan = std::chrono::steady_clock::now();
+        libusb_handle_events_timeout(ctx_, &tv);
+        // How many completions one wakeup collected. This is what tells a late
+        // collection from a quiet bus: a gap ending with six callbacks at once
+        // means the device had delivered all six and nothing was there to take
+        // them, while a gap ending with one means there was nothing to take.
+        // The gap alone cannot say which, and neither can the callback's own
+        // off-CPU time, which is tens of microseconds while gaps are
+        // milliseconds.
+        const uint32_t collected =
+            callbacksThisPoll_.load(std::memory_order_relaxed);
+        uint32_t worst = maxCallbacksPerPoll_.load(std::memory_order_relaxed);
+        while (collected > worst &&
+               !maxCallbacksPerPoll_.compare_exchange_weak(
+                   worst, collected, std::memory_order_relaxed)) {}
+        // The discriminator. An iteration that collects several completions at
+        // once followed a gap; the question is what the thread was doing
+        // through it. If its runqueue wait grew by about the gap, it was
+        // runnable and not given a CPU. If it did not grow, it was never made
+        // runnable - the completions were ready and the wakeup did not come.
+        if (measureRunqueue && collected > 1) {
+            const uint64_t waitedNs = runqueue.waitNs() > runqueueBefore
+                ? runqueue.waitNs() - runqueueBefore : 0;
+            const uint64_t spanNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - pollBegan).count());
+            uint64_t worstSpan =
+                worstMultiCollectSpanNs_.load(std::memory_order_relaxed);
+            if (spanNs > worstSpan) {
+                worstMultiCollectSpanNs_.store(spanNs, std::memory_order_relaxed);
+                worstMultiCollectRunqueueNs_.store(waitedNs,
+                                                   std::memory_order_relaxed);
+            }
+        }
+    }
+    eventThreadTid_.store(0, std::memory_order_release);
+}
+
 bool LibusbUacDriver::ensureEventThread() {
     if (eventThread_.joinable()) return true;
-    eventThread_ = std::thread([this]() {
-        eventThreadTid_.store(
-            static_cast<int32_t>(guitarrackcraft::getTid()),
-            std::memory_order_release);
-        eventThreadUrgentAudio_.store(
-            guitarrackcraft::setCurrentThreadUrgentAudio("UsbIsoEvents"),
-            std::memory_order_release);
-        while (!stopRequested_.load(std::memory_order_acquire)) {
-            timeval tv{0, 100000};
-            libusb_handle_events_timeout(ctx_, &tv);
-        }
-        eventThreadTid_.store(0, std::memory_order_release);
-    });
+    eventThread_ = std::thread([this]() { runEventLoop(); });
     return true;
 }
 
@@ -2481,7 +2553,29 @@ bool LibusbUacDriver::stopIsoPump() {
 }
 
 void LibusbUacDriver::onIsoTrampoline(libusb_transfer* xfr) {
-    static_cast<LibusbUacDriver*>(xfr->user_data)->onIso(xfr);
+    auto* self = static_cast<LibusbUacDriver*>(xfr->user_data);
+    self->callbacksThisPoll_.fetch_add(1, std::memory_order_relaxed);
+    // The render thread has had an off-CPU figure for a while; servicing has
+    // not, and servicing is the half that the submitted runway exists to
+    // cover. Same subtraction: wall time the callback took, minus the CPU time
+    // it used, is the callback being descheduled halfway through resubmitting
+    // a transfer the device is already waiting on.
+    const uint64_t cpuBegan = guitarrackcraft::threadCpuNanoseconds();
+    const auto wallBegan = std::chrono::steady_clock::now();
+    self->onIso(xfr);
+    if (cpuBegan != 0) {
+        const uint64_t wallNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wallBegan).count());
+        const uint64_t cpuNs =
+            guitarrackcraft::threadCpuNanoseconds() - cpuBegan;
+        const uint64_t offCpuNs = wallNs > cpuNs ? wallNs - cpuNs : 0;
+        uint64_t worst = self->worstServiceOffCpuNs_.load(
+            std::memory_order_relaxed);
+        while (worst < offCpuNs &&
+               !self->worstServiceOffCpuNs_.compare_exchange_weak(
+                   worst, offCpuNs, std::memory_order_relaxed)) {}
+    }
 }
 
 void LibusbUacDriver::onFeedbackTrampoline(libusb_transfer* xfr) {

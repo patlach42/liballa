@@ -254,6 +254,21 @@ public:
         return flightRecorder_;
     }
 
+    void setMeasureServiceRunqueue(bool enabled) noexcept {
+        measureServiceRunqueue_.store(enabled, std::memory_order_relaxed);
+    }
+    uint64_t worstMultiCollectSpanNs() const noexcept {
+        return worstMultiCollectSpanNs_.load(std::memory_order_relaxed);
+    }
+    uint64_t worstMultiCollectRunqueueNs() const noexcept {
+        return worstMultiCollectRunqueueNs_.load(std::memory_order_relaxed);
+    }
+    uint32_t maxCallbacksPerPoll() const noexcept {
+        return maxCallbacksPerPoll_.load(std::memory_order_relaxed);
+    }
+    uint64_t worstServiceOffCpuNs() const noexcept {
+        return worstServiceOffCpuNs_.load(std::memory_order_relaxed);
+    }
     int32_t eventThreadTid() const noexcept {
         return eventThreadTid_.load(std::memory_order_acquire);
     }
@@ -396,7 +411,11 @@ public:
                                  std::memory_order_relaxed);
         for (auto& bucket : ringOccupancy_) {
             bucket.store(0, std::memory_order_relaxed);
-        }
+            worstServiceOffCpuNs_.store(0, std::memory_order_relaxed);
+        maxCallbacksPerPoll_.store(0, std::memory_order_relaxed);
+        worstMultiCollectSpanNs_.store(0, std::memory_order_relaxed);
+        worstMultiCollectRunqueueNs_.store(0, std::memory_order_relaxed);
+    }
         ringOccupancySamples_.store(0, std::memory_order_relaxed);
     }
     // Credit is granted by played frames and spent by published quanta. Before
@@ -616,6 +635,7 @@ private:
     void captureRangeForClock(uint8_t clockId);
 
     bool startIsoPump(bool submit = true);
+    void runEventLoop();
     bool ensureEventThread();
     bool line6SelectFormat(StreamFormat* playback, StreamFormat* capture);
     bool line6VendorSetup();
@@ -730,6 +750,16 @@ private:
     int captureMaxFramesPerPacket_ = 0;
     std::atomic<bool> eventThreadUrgentAudio_{false};
     std::atomic<int32_t> eventThreadTid_{0};
+    // Worst time a completion callback spent runnable and not running.
+    std::atomic<uint64_t> worstServiceOffCpuNs_{0};
+    // Completions collected by one event-loop wakeup, and the worst such count.
+    std::atomic<uint32_t> callbacksThisPoll_{0};
+    std::atomic<uint32_t> maxCallbacksPerPoll_{0};
+    // The longest event-loop iteration that ended up collecting more than one
+    // completion, and how much of it the thread spent waiting for a CPU.
+    std::atomic<uint64_t> worstMultiCollectSpanNs_{0};
+    std::atomic<uint64_t> worstMultiCollectRunqueueNs_{0};
+    std::atomic<bool> measureServiceRunqueue_{false};
 
     // Iso pump state — touched only from the event thread once
     // streaming_ is true.

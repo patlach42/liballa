@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <ctime>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -41,6 +43,16 @@ inline long getTid() {
 #else
     return static_cast<long>(pthread_self());
 #endif
+}
+
+// Wall time minus this over the same span is the time the thread was runnable
+// and not running. Two vDSO reads, so it can bracket work on an audio thread
+// without being the disturbance it is there to find.
+inline uint64_t threadCpuNanoseconds() noexcept {
+    timespec ts{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+           static_cast<uint64_t>(ts.tv_nsec);
 }
 
 #if defined(__linux__)
@@ -70,6 +82,118 @@ inline cpu_set_t deriveAudioCpuMask(const cpu_set_t& allowed) noexcept {
     return audio;
 }
 
+// The pool above is two cores for two threads, and handing both threads the
+// same pair leaves the placement to the scheduler, which is free to stack them
+// on one core and leave the other idle. Naming a core per role is what the
+// comment on the pool always intended. The render thread takes the
+// highest-ranked core; USB servicing takes the other, because a completion the
+// device is waiting on cannot be made up later. When the pool has only one CPU
+// to give, both roles get it and the split is a no-op.
+enum class AudioCpuRole { Render, Service };
+
+// Affinity is switchable at runtime, and it exists for one reason: the syscall
+// fix that made audio affinity work also made the UI affinity call in the
+// activity work, so every comparison between "pinned" and "unpinned" moved two
+// things at once and could attribute the difference to neither. One binary
+// with both switchable is what separates them.
+//
+// Defaults reproduce what the driver does when nobody sets anything.
+// ExclusiveSplit also narrows the render thread to the rest of the pool, so
+// the two never contend. Measured worth revisiting once the render thread's
+// own tail came down.
+enum class ServiceCpuPlacement { OneCoreOfPool, WholePool, ExclusiveSplit };
+
+inline std::atomic<bool>& audioAffinityEnabledFlag() noexcept {
+    static std::atomic<bool> enabled{true};
+    return enabled;
+}
+inline std::atomic<bool>& uiAffinityEnabledFlag() noexcept {
+    static std::atomic<bool> enabled{true};
+    return enabled;
+}
+// The whole pool, never one core of it. This platform runs core control on the
+// prime cluster: with min_cpus of one and a busy threshold of sixty percent,
+// it parks the second prime core whenever the cluster is quiet - and audio
+// keeps it at about seventeen percent, so one of the two is parked nearly
+// always. A thread pinned to one of them is runnable with nowhere to run every
+// time the parked one is the one it is pinned to, which is where the
+// millisecond runqueue waits came from. Pinning to the cluster leaves it
+// somewhere to go.
+inline std::atomic<int>& serviceCpuPlacementFlag() noexcept {
+    static std::atomic<int> placement{
+        static_cast<int>(ServiceCpuPlacement::WholePool)};
+    return placement;
+}
+
+inline void setAudioAffinityEnabled(bool enabled) noexcept {
+    audioAffinityEnabledFlag().store(enabled, std::memory_order_relaxed);
+}
+inline void setUiAffinityEnabled(bool enabled) noexcept {
+    uiAffinityEnabledFlag().store(enabled, std::memory_order_relaxed);
+}
+inline void setServiceCpuPlacement(ServiceCpuPlacement placement) noexcept {
+    serviceCpuPlacementFlag().store(static_cast<int>(placement),
+                                    std::memory_order_relaxed);
+}
+
+// Only USB servicing is pinned, and only onto one core of the pool. The render
+// thread is left wherever the platform puts it.
+//
+// The asymmetry is what measurement kept pointing at, and it follows from what
+// each thread can recover from. A completion the device is waiting on cannot
+// be made up later, and servicing does almost no work, so it wants one fast
+// core and no migrations. The graph has a deadline every quantum and a peak
+// far above its average cost, so every restriction placed on it made things
+// worse: held to one core of the pool it starved in two cycles out of five,
+// and moved below the pool - six cores at 3.63 GHz against the pool's 4.61 -
+// its peak cycle went from 120 microseconds to 3.6 milliseconds against a
+// 1.33 ms budget and every cycle failed.
+//
+// Leaving it unpinned is also the conservative reading of the platform's own
+// advice, which is that applications should not normally set CPU affinity at
+// all because topology and thermal behaviour vary by device. Servicing is the
+// one place the measurement earns the exception.
+inline cpu_set_t deriveAudioRoleCpuMask(const cpu_set_t& allowed,
+                                        AudioCpuRole role) noexcept {
+    const cpu_set_t pool = deriveAudioCpuMask(allowed);
+    const auto placement = static_cast<ServiceCpuPlacement>(
+        serviceCpuPlacementFlag().load(std::memory_order_relaxed));
+    if (placement == ServiceCpuPlacement::ExclusiveSplit) {
+        int lowest = -1;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (CPU_ISSET(cpu, &pool)) { lowest = cpu; break; }
+        }
+        if (lowest < 0 || CPU_COUNT(&pool) < 2) return pool;
+        cpu_set_t chosen;
+        CPU_ZERO(&chosen);
+        if (role == AudioCpuRole::Service) {
+            CPU_SET(lowest, &chosen);
+        } else {
+            for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+                if (CPU_ISSET(cpu, &pool) && cpu != lowest) CPU_SET(cpu, &chosen);
+            }
+        }
+        return chosen;
+    }
+    // The graph gets the fast pair and may migrate inside it. Leaving it
+    // unpinned was measured and is not neutral: the platform places it on the
+    // slow cluster and the peak cycle goes from about 120 microseconds to
+    // between one and three and a half milliseconds against a 1.33 ms budget.
+    if (role == AudioCpuRole::Render)
+        return pool;
+    if (placement == ServiceCpuPlacement::WholePool) return pool;
+    int lowestPool = -1;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &pool)) { lowestPool = cpu; break; }
+    }
+    if (lowestPool < 0)
+        return allowed;
+    cpu_set_t chosen;
+    CPU_ZERO(&chosen);
+    CPU_SET(lowestPool, &chosen);
+    return chosen;
+}
+
 // Keep UI descendants away from the CPUs reserved for Direct USB audio. On
 // constrained one/two-CPU cpusets preserve at least one runnable UI CPU.
 inline cpu_set_t deriveUiCpuMask(const cpu_set_t& allowed) noexcept {
@@ -93,8 +217,18 @@ inline cpu_set_t deriveUiCpuMask(const cpu_set_t& allowed) noexcept {
 }
 
 inline void applyCurrentThreadUiAffinity() noexcept {
+    if (!uiAffinityEnabledFlag().load(std::memory_order_relaxed))
+        return;
+    // Two things the raw system call does not do for you, and the libc wrapper
+    // does. It reports success by returning the number of bytes it copied into
+    // the mask rather than zero, so testing for zero failed on every
+    // successful call. And it writes only those bytes: the rest of a 128 byte
+    // cpu_set_t keeps whatever was on the stack, which read back as CPUs that
+    // do not exist and made the derived mask invalid. The first fault hid the
+    // second by returning before anything was set.
     cpu_set_t allowed;
-    if (syscall(SYS_sched_getaffinity, 0, sizeof(allowed), &allowed) != 0)
+    CPU_ZERO(&allowed);
+    if (syscall(SYS_sched_getaffinity, 0, sizeof(allowed), &allowed) < 0)
         return;
     const cpu_set_t ui = deriveUiCpuMask(allowed);
     if (CPU_COUNT(&ui) == 0)
@@ -102,12 +236,27 @@ inline void applyCurrentThreadUiAffinity() noexcept {
     (void)syscall(SYS_sched_setaffinity, 0, sizeof(ui), &ui);
 }
 
-inline void applyCurrentThreadAudioAffinity() noexcept {
-    cpu_set_t allowed;
-    if (syscall(SYS_sched_getaffinity, 0, sizeof(allowed), &allowed) != 0)
+inline void applyCurrentThreadAudioAffinity(AudioCpuRole role) noexcept {
+    if (!audioAffinityEnabledFlag().load(std::memory_order_relaxed))
         return;
-    const cpu_set_t audio = deriveAudioCpuMask(allowed);
+    // Two things the raw system call does not do for you, and the libc wrapper
+    // does. It reports success by returning the number of bytes it copied into
+    // the mask rather than zero, so testing for zero failed on every
+    // successful call. And it writes only those bytes: the rest of a 128 byte
+    // cpu_set_t keeps whatever was on the stack, which read back as CPUs that
+    // do not exist and made the derived mask invalid. The first fault hid the
+    // second by returning before anything was set.
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (syscall(SYS_sched_getaffinity, 0, sizeof(allowed), &allowed) < 0)
+        return;
+    const cpu_set_t audio = deriveAudioRoleCpuMask(allowed, role);
     if (CPU_COUNT(&audio) == 0)
+        return;
+    // A role that asks for everything it already has is asking not to be
+    // pinned. Setting the mask anyway would be a no-op today and a way to
+    // freeze a stale cpuset tomorrow, so it is not set.
+    if (CPU_EQUAL(&audio, &allowed))
         return;
     (void)syscall(SYS_sched_setaffinity, 0, sizeof(audio), &audio);
 }
@@ -141,6 +290,25 @@ public:
         setPreferPowerEfficiency_ =
             reinterpret_cast<SetPreferPowerEfficiencyFn>(
                 dlsym(library_, "APerformanceHint_setPreferPowerEfficiency"));
+        // API 35 lets a session report the wall time a work period took and the
+        // CPU time inside it as separate numbers. That distinction is the whole
+        // story for an audio callback: the old single-number call could only be
+        // given the CPU cost, which for this graph is about ten microseconds
+        // against a deadline of thirteen hundred - a workload the system is
+        // entitled to place anywhere and clock down. Resolved dynamically like
+        // the rest, so an older device simply keeps the old signal.
+        workDurationCreate_ = reinterpret_cast<WorkDurationCreateFn>(
+            dlsym(library_, "AWorkDuration_create"));
+        workDurationRelease_ = reinterpret_cast<WorkDurationReleaseFn>(
+            dlsym(library_, "AWorkDuration_release"));
+        workDurationSetStart_ = reinterpret_cast<WorkDurationSetI64Fn>(
+            dlsym(library_, "AWorkDuration_setWorkPeriodStartTimestampNanos"));
+        workDurationSetTotal_ = reinterpret_cast<WorkDurationSetI64Fn>(
+            dlsym(library_, "AWorkDuration_setActualTotalDurationNanos"));
+        workDurationSetCpu_ = reinterpret_cast<WorkDurationSetI64Fn>(
+            dlsym(library_, "AWorkDuration_setActualCpuDurationNanos"));
+        reportActual2_ = reinterpret_cast<ReportActual2Fn>(
+            dlsym(library_, "APerformanceHint_reportActualWorkDuration2"));
         if (!getManager_ || !createSession_ || !reportActual_ || !closeSession_) {
             dlclose(library_);
             library_ = nullptr;
@@ -163,6 +331,14 @@ public:
         if (session_ && setPreferPowerEfficiency_) {
             (void)setPreferPowerEfficiency_(session_, false);
         }
+        // One work-duration object for the life of the session: the render
+        // thread fills it in and hands it over each period, so nothing is
+        // allocated on the audio path.
+        if (session_ && workDurationCreate_ && workDurationRelease_ &&
+            workDurationSetStart_ && workDurationSetTotal_ &&
+            workDurationSetCpu_ && reportActual2_) {
+            workDuration_ = workDurationCreate_();
+        }
 #else
         (void)targetDurationNs;
         (void)threadIds;
@@ -172,6 +348,7 @@ public:
 
     ~PerformanceHintSession() {
 #if defined(__ANDROID__)
+        if (workDuration_ && workDurationRelease_) workDurationRelease_(workDuration_);
         if (session_ && closeSession_) closeSession_(session_);
         if (library_) dlclose(library_);
 #endif
@@ -210,6 +387,33 @@ public:
 #endif
     }
 
+    bool canReportWorkDuration() const noexcept {
+#if defined(__ANDROID__)
+        return workDuration_ != nullptr;
+#else
+        return false;
+#endif
+    }
+
+    // Wall time the period took and the CPU time inside it. Telling the system
+    // both is what lets it see a deadline the work is nowhere near consuming
+    // but must not miss, which one number could never express.
+    void reportWorkDuration(int64_t startTimestampNs, uint64_t totalNs,
+                            uint64_t cpuNs) noexcept {
+#if defined(__ANDROID__)
+        if (!workDuration_ || totalNs == 0) return;
+        workDurationSetStart_(workDuration_, startTimestampNs);
+        workDurationSetTotal_(workDuration_, static_cast<int64_t>(totalNs));
+        workDurationSetCpu_(workDuration_, static_cast<int64_t>(
+            cpuNs > 0 ? cpuNs : 1));
+        (void)reportActual2_(session_, workDuration_);
+#else
+        (void)startTimestampNs;
+        (void)totalNs;
+        (void)cpuNs;
+#endif
+    }
+
     void reportActualWorkDuration(uint64_t durationNs) noexcept {
 #if defined(__ANDROID__)
         if (session_ && durationNs > 0) {
@@ -228,6 +432,10 @@ private:
     using SetThreadsFn = int (*)(void*, const int32_t*, size_t);
     using SetPreferPowerEfficiencyFn = int (*)(void*, bool);
     using CloseSessionFn = void (*)(void*);
+    using WorkDurationCreateFn = void* (*)();
+    using WorkDurationReleaseFn = void (*)(void*);
+    using WorkDurationSetI64Fn = void (*)(void*, int64_t);
+    using ReportActual2Fn = int (*)(void*, void*);
 
     void* library_ = nullptr;
     void* session_ = nullptr;
@@ -237,6 +445,13 @@ private:
     SetThreadsFn setThreads_ = nullptr;
     SetPreferPowerEfficiencyFn setPreferPowerEfficiency_ = nullptr;
     CloseSessionFn closeSession_ = nullptr;
+    void* workDuration_ = nullptr;
+    WorkDurationCreateFn workDurationCreate_ = nullptr;
+    WorkDurationReleaseFn workDurationRelease_ = nullptr;
+    WorkDurationSetI64Fn workDurationSetStart_ = nullptr;
+    WorkDurationSetI64Fn workDurationSetTotal_ = nullptr;
+    WorkDurationSetI64Fn workDurationSetCpu_ = nullptr;
+    ReportActual2Fn reportActual2_ = nullptr;
 #endif
 };
 
@@ -298,12 +513,15 @@ private:
 // Best-effort Android/Linux realtime scheduling for app-owned audio threads.
 // Prefer SCHED_FIFO when permitted, then Android's urgent-audio nice level.
 // Call only once at thread startup; failure is exposed through diagnostics.
-inline bool setCurrentThreadUrgentAudio(const char* name) noexcept {
+inline bool setCurrentThreadUrgentAudio(const char* name,
+                                        AudioCpuRole role) noexcept {
     if (name != nullptr) {
         (void)pthread_setname_np(pthread_self(), name);
     }
 #if defined(__linux__)
-    applyCurrentThreadAudioAffinity();
+    applyCurrentThreadAudioAffinity(role);
+#else
+    (void)role;
 #endif
 #if defined(__ANDROID__) && defined(__linux__)
     sched_param realtime{};
