@@ -624,8 +624,13 @@ private:
     void inspectCaptureLevel(const float* samples, int frames) noexcept {
         const float threshold =
             captureModulationThreshold_.load(std::memory_order_relaxed);
-        if (threshold <= 0.0f || !samples || frames <= 0 ||
-            !driver_.flightRecorder().enabled()) {
+        // Counting an event and recording it are different things, and tying
+        // them together made the counter depend on a diagnostic nobody enables
+        // by default. Asking for the loopback check without the recorder
+        // produced "detector never armed" while a listener could hear the
+        // breaks it was meant to count. The recorder is still optional; the
+        // detection is not.
+        if (threshold <= 0.0f || !samples || frames <= 0) {
             return;
         }
         for (int frame = 0; frame < frames; ++frame) {
@@ -657,7 +662,7 @@ private:
                 std::fabs(level - levelReference_) / levelReference_;
             if (deviation > threshold) {
                 captureModulations_.fetch_add(1, std::memory_order_relaxed);
-                driver_.flightRecorder().record(
+                if (driver_.flightRecorder().enabled()) driver_.flightRecorder().record(
                     monotrypt::usb::PacketFlightRecorder::Event::
                         CaptureModulation,
                     monotrypt::usb::monotonicNowNs(),
@@ -679,8 +684,13 @@ private:
     void inspectCapture(const float* samples, int frames) noexcept {
         const float threshold =
             captureDiscontinuityThreshold_.load(std::memory_order_relaxed);
-        if (threshold <= 0.0f || !samples || frames <= 0 ||
-            !driver_.flightRecorder().enabled()) {
+        // Counting an event and recording it are different things, and tying
+        // them together made the counter depend on a diagnostic nobody enables
+        // by default. Asking for the loopback check without the recorder
+        // produced "detector never armed" while a listener could hear the
+        // breaks it was meant to count. The recorder is still optional; the
+        // detection is not.
+        if (threshold <= 0.0f || !samples || frames <= 0) {
             return;
         }
         for (int frame = 0; frame < frames; ++frame) {
@@ -718,7 +728,7 @@ private:
             }
             if (settled && step > threshold * capturePeak_) {
                 captureDiscontinuities_.fetch_add(1, std::memory_order_relaxed);
-                driver_.flightRecorder().record(
+                if (driver_.flightRecorder().enabled()) driver_.flightRecorder().record(
                     monotrypt::usb::PacketFlightRecorder::Event::
                         CaptureDiscontinuity,
                     monotrypt::usb::monotonicNowNs(),
@@ -734,13 +744,16 @@ private:
 
     // Walks the block once comparing each sample with its predecessor, the
     // previous block's last sample included, so a break at a block boundary is
-    // caught too. One subtract and compare per sample, and only while the
-    // recorder is armed.
+    // caught too. One subtract and compare per sample, always: it used to run
+    // only while the recorder was armed, which made the count of a fault
+    // depend on a diagnostic that is off by default.
     void inspectContinuity(const float* left, const float* right,
                            int frames) noexcept {
         const float threshold =
             discontinuityThreshold_.load(std::memory_order_relaxed);
-        if (threshold <= 0.0f || !driver_.flightRecorder().enabled()) return;
+        // Same separation as the capture detectors: the count is the finding,
+        // the recorder is only how it is inspected afterwards.
+        if (threshold <= 0.0f) return;
         const float* const channels[2] = {left, right};
         for (int channel = 0; channel < 2; ++channel) {
             float previous = lastSample_[channel];
@@ -751,7 +764,8 @@ private:
                 if (step > threshold && continuitySeeded_) {
                     signalDiscontinuities_.fetch_add(
                         1, std::memory_order_relaxed);
-                    driver_.flightRecorder().record(
+                    if (driver_.flightRecorder().enabled())
+                        driver_.flightRecorder().record(
                         monotrypt::usb::PacketFlightRecorder::Event::
                             SignalDiscontinuity,
                         monotrypt::usb::monotonicNowNs(),
