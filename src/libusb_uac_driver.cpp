@@ -1212,6 +1212,11 @@ bool LibusbUacDriver::start(int sampleRateHz, int bitsPerSample, int channels,
         }
         captureHead_.store(0, std::memory_order_relaxed);
         captureTail_.store(0, std::memory_order_relaxed);
+        // Session scoped, not envelope scoped: clearing these at the warmup
+        // boundary would re-arm the priming exemption mid-stream and silence a
+        // genuine trim.
+        captureLive_.store(false, std::memory_order_relaxed);
+        startupCaptureDiscardFrames_.store(0, std::memory_order_relaxed);
         captureSequence_.store(0, std::memory_order_relaxed);
         captureOverruns_.store(0, std::memory_order_relaxed);
         metadataFifoOverruns_.store(0, std::memory_order_relaxed);
@@ -1970,7 +1975,16 @@ LibusbUacDriver::prepareCaptureRead(int requestedFrames) noexcept {
         // The consumer owns tail and may discard stale capture while retaining
         // the newest bounded window after a render stall.
         tail = head - limitBytes;
-        captureOverruns_.fetch_add(1, std::memory_order_relaxed);
+        // Only once the stream is live. Capture starts before the graph does -
+        // it has to, because the OUT packet plan is sized from capture
+        // completions - so the first read used to find every frame captured
+        // during graph activation, ring priming and thread start, trim them in
+        // one go, and count an overrun for it. That is timeline alignment, not
+        // the consumer falling behind, and counting it made every session
+        // report a fault it did not have.
+        if (captureLive_.load(std::memory_order_acquire)) {
+            captureOverruns_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     const size_t availableFrames =
@@ -2016,6 +2030,31 @@ int LibusbUacDriver::readCapturePcm(uint8_t* dst, int frames) {
     }
     commitCaptureRead(region);
     return region.frames;
+}
+
+// The handover from priming to live capture, called once by the consumer just
+// before its first read. Keeps the newest window the graph is about to want,
+// drops the pre-roll behind it, and records how much was dropped so the event
+// is classified rather than erased. Runs on the render thread, which is the
+// only owner of the capture tail, so there is no second consumer to race.
+int LibusbUacDriver::beginCaptureLive(int keepFrames) noexcept {
+    if (captureLive_.exchange(true, std::memory_order_acq_rel)) return 0;
+    if (!captureActive_.load(std::memory_order_acquire)) return 0;
+    const int stride = captureFormat_.channels * captureFormat_.bytesPerSample;
+    if (stride <= 0) return 0;
+    const size_t head = captureHead_.load(std::memory_order_acquire);
+    const size_t tail = captureTail_.load(std::memory_order_relaxed);
+    const size_t availableFrames =
+        (head - tail) / static_cast<size_t>(stride);
+    const size_t keep = keepFrames > 0 ? static_cast<size_t>(keepFrames) : 0;
+    if (availableFrames <= keep) return 0;
+    const size_t discarded = availableFrames - keep;
+    captureTail_.store(
+        tail + discarded * static_cast<size_t>(stride),
+        std::memory_order_release);
+    startupCaptureDiscardFrames_.store(static_cast<uint64_t>(discarded),
+                                       std::memory_order_relaxed);
+    return static_cast<int>(discarded);
 }
 
 int LibusbUacDriver::discardCaptureFrames(int maxFrames) noexcept {
@@ -3196,6 +3235,11 @@ bool LibusbUacDriver::configureUserspaceBuffers(
     ringTail_.store(0, std::memory_order_release);
     captureHead_.store(0, std::memory_order_release);
     captureTail_.store(0, std::memory_order_release);
+    // Session scoped, not envelope scoped: clearing these at the warmup
+    // boundary would re-arm the priming exemption mid-stream and silence a
+    // genuine trim.
+    captureLive_.store(false, std::memory_order_relaxed);
+    startupCaptureDiscardFrames_.store(0, std::memory_order_relaxed);
     userspaceBufferConfig_ = config;
     transferCount_ = config.transferCount != 0 ? config.transferCount : kDefaultNumTransfers;
     return true;
@@ -3285,7 +3329,10 @@ bool LibusbUacDriver::waitForPlaybackCreditUntil(
     // transport failure, not a reason to block the render thread forever.
     // The ledger is written minus played, so in steady state it sits at minus
     // the whole pipeline: the ring, the frames already handed to USB, and a
-    // held block if there is one. Comparing that against minus the reserve
+    // held block if there is one. The runway term is the live count. Using
+    // the intended one instead looks safer - a live term is inside the loop
+    // the gate is meant to close - and measured worse: 193 starvation events
+    // and 273 breaks in a cycle that had been clean. Kept as measured. Comparing that against minus the reserve
     // asked whether the entire pipeline fits inside the reserve, which it
     // never does - so once the accounting was made honest the gate could not
     // open at all and every block went through the holding slot. The reserve

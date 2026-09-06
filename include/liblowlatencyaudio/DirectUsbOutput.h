@@ -392,6 +392,12 @@ public:
     int discardCaptureFrames(int frames) noexcept {
         return driver_.discardCaptureFrames(frames);
     }
+    int beginCaptureLive(int keepFrames) noexcept {
+        return driver_.beginCaptureLive(keepFrames);
+    }
+    uint64_t startupCaptureDiscardFrames() const noexcept {
+        return driver_.startupCaptureDiscardFrames();
+    }
 
     uint64_t xrunCount() const noexcept {
         return driver_.playbackXRunCount();

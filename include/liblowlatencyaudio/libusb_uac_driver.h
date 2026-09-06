@@ -206,6 +206,10 @@ public:
         playbackUnderruns_.store(0, std::memory_order_relaxed);
     }
     int discardCaptureFrames(int maxFrames) noexcept;
+    int beginCaptureLive(int keepFrames) noexcept;
+    uint64_t startupCaptureDiscardFrames() const noexcept {
+        return startupCaptureDiscardFrames_.load(std::memory_order_relaxed);
+    }
     uint64_t capturePacketDropCount() const noexcept {
         return capturePacketDrops_.load(std::memory_order_acquire);
     }
@@ -776,6 +780,10 @@ private:
     // Completions collected by one event-loop wakeup, and the worst such count.
     std::atomic<uint32_t> callbacksThisPoll_{0};
     std::atomic<uint32_t> maxCallbacksPerPoll_{0};
+    // Capture runs before the graph does, so its first frames belong to a
+    // priming epoch rather than to the stream the graph will render.
+    std::atomic<bool> captureLive_{false};
+    std::atomic<uint64_t> startupCaptureDiscardFrames_{0};
     // The longest event-loop iteration that ended up collecting more than one
     // completion, and how much of it the thread spent waiting for a CPU.
     std::atomic<uint64_t> worstMultiCollectSpanNs_{0};
