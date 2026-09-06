@@ -3268,10 +3268,20 @@ void LibusbUacDriver::setUserspaceBufferConfig(
         ? automaticPrime : userConfig.startupPrimeFrames;
     const int captureWave = std::max(1, captureTransferFrames_.load(
         std::memory_order_acquire));
-    const int automaticCaptureTarget = captureWave >
-            std::numeric_limits<int>::max() / 2
-        ? std::numeric_limits<int>::max()
-        : captureWave * 2;
+    // One completion wave, not two. Two was never measured; one was, across a
+    // sweep at the pinned geometry, and it takes about 0.5 ms of round trip out
+    // while leaving every wait timeout soft - the deadline expiring with a whole
+    // quantum still present, which is the reserve being spent as intended
+    // rather than a block being lost. Half a wave breaks: the sweep's next step
+    // down timed out with 29 frames against a 32 frame quantum, missed the
+    // deadline and was heard by the loopback detector.
+    //
+    // One wave is also where the arithmetic stops being lucky. The graph
+    // quantum and the capture chunk share a factor of eight, so a threshold of
+    // quantum plus one wave is crossed with enough in hand that a whole
+    // quantum survives the read; a threshold one chunk lower can be crossed
+    // with less than a quantum left behind.
+    const int automaticCaptureTarget = captureWave;
     const int captureTarget = monotrypt::usb::resolveOptionalFrames(
         userConfig.captureTargetFrames, automaticCaptureTarget);
     const int captureHeadroom = monotrypt::usb::resolveOptionalFrames(

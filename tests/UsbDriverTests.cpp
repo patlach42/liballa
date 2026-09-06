@@ -667,7 +667,7 @@ TEST(UsbDriverRing, PartialAdmissionReportsWholeFramesAndCallerCanSubmitTail) {
               std::vector<uint8_t>(input.begin() + submitted * frameStride,
                                     input.end()));
 }
-TEST(UsbDriverUserspaceBuffer, CaptureAutoTargetUsesTwoTransferWaves) {
+TEST(UsbDriverUserspaceBuffer, CaptureAutoTargetIsOneTransferWave) {
     monotrypt::usb::LibusbUacDriver driver;
     monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
     monotrypt::usb::UsbDriverTestAccess::captureFormat(driver, 2, 2);
@@ -678,11 +678,33 @@ TEST(UsbDriverUserspaceBuffer, CaptureAutoTargetUsesTwoTransferWaves) {
     ASSERT_TRUE(driver.configureUserspaceBuffers(config));
     driver.setUserspaceBufferConfig(16, config);
 
-    // Automatic capture target covers two waves; headroom and deadline
-    // slack each cover one complete capture wave.
-    EXPECT_EQ(driver.captureTargetFrames(), 64);
+    // One wave each. The target used to cover two, which was never measured
+    // against one; one was, and it takes about half a millisecond of round trip
+    // out while every wait timeout stays soft.
+    EXPECT_EQ(driver.captureTargetFrames(), 32);
     EXPECT_EQ(driver.captureHeadroomFrames(), 32);
     EXPECT_EQ(driver.captureDeadlineSlackFrames(), 32);
+}
+
+TEST(UsbDriverUserspaceBuffer, ExplicitZeroCaptureTargetIsNotTheAutomaticOne) {
+    monotrypt::usb::LibusbUacDriver driver;
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
+    monotrypt::usb::UsbDriverTestAccess::captureFormat(driver, 2, 2);
+    monotrypt::usb::UsbDriverTestAccess::captureTransferFrames(driver, 32);
+
+    monotrypt::usb::UserspaceBufferConfig config;
+    config.ringCapacityBytes = 4096;
+    config.captureTargetFrames = monotrypt::usb::kExplicitZeroFrames;
+    config.captureDeadlineSlackFrames = monotrypt::usb::kExplicitZeroFrames;
+    ASSERT_TRUE(driver.configureUserspaceBuffers(config));
+    driver.setUserspaceBufferConfig(16, config);
+
+    // The sentinel is the whole reason it exists: a plain zero here would come
+    // back as the derived wave, and an arm asking for no reserve would silently
+    // measure the automatic one instead.
+    EXPECT_EQ(driver.captureTargetFrames(), 0);
+    EXPECT_EQ(driver.captureDeadlineSlackFrames(), 0);
+    EXPECT_EQ(driver.captureHeadroomFrames(), 32);
 }
 
 
