@@ -3283,8 +3283,17 @@ bool LibusbUacDriver::waitForPlaybackCreditUntil(
     // waiting for the device to consume - which is exactly what paces the
     // producer. A deadline still applies: a device that stops consuming is a
     // transport failure, not a reason to block the render thread forever.
+    // The ledger is written minus played, so in steady state it sits at minus
+    // the whole pipeline: the ring, the frames already handed to USB, and a
+    // held block if there is one. Comparing that against minus the reserve
+    // asked whether the entire pipeline fits inside the reserve, which it
+    // never does - so once the accounting was made honest the gate could not
+    // open at all and every block went through the holding slot. The reserve
+    // is a lead beyond the intended depth, so the depth belongs in the floor.
     const int64_t floor =
-        -static_cast<int64_t>(playbackCreditReserve_.load(std::memory_order_relaxed));
+        -static_cast<int64_t>(playbackTargetFrames_.load(std::memory_order_relaxed)) -
+        static_cast<int64_t>(queuedOutFrames_.load(std::memory_order_relaxed)) -
+        static_cast<int64_t>(playbackCreditReserve_.load(std::memory_order_relaxed));
     const WakeChannel::Registration waiting(playbackWake_);
     while (playbackCredit_.load(std::memory_order_acquire) - frames < floor &&
            streaming_.load(std::memory_order_acquire) &&

@@ -456,11 +456,32 @@ public:
     int playbackCreditReserve() const noexcept {
         return playbackCreditReserve_.load(std::memory_order_relaxed);
     }
+    // An unconditional debit, for audio that is going out whether or not the
+    // ledger has room for it. The reserve is an admission rule - how far the
+    // producer may run ahead before it is made to wait - and it has no business
+    // deciding whether a block that has already been accepted gets recorded.
+    // Refusing the charge instead of taking it let a block enter the holding
+    // slot unpaid and be republished free, and each one of those granted a
+    // whole quantum of lead that nothing ever took back.
+    void chargePlaybackCredit(int frames) noexcept {
+        if (frames <= 0) return;
+        if (!playbackStarted_.load(std::memory_order_acquire)) return;
+        playbackCredit_.fetch_sub(static_cast<int64_t>(frames),
+                                  std::memory_order_acq_rel);
+    }
+
     bool takePlaybackCredit(int frames) noexcept {
         if (frames <= 0) return true;
         if (!playbackStarted_.load(std::memory_order_acquire)) return true;
+        // Same floor as the wait: the ledger measures the whole pipeline, so
+        // the intended depth belongs in the comparison and the reserve is the
+        // lead permitted beyond it.
         const int64_t floor =
-            -static_cast<int64_t>(playbackCreditReserve_.load(
+            -static_cast<int64_t>(playbackTargetFrames_.load(
+                std::memory_order_relaxed)) -
+            static_cast<int64_t>(queuedOutFrames_.load(
+                std::memory_order_relaxed)) -
+            static_cast<int64_t>(playbackCreditReserve_.load(
                 std::memory_order_relaxed));
         int64_t credit = playbackCredit_.load(std::memory_order_relaxed);
         while (credit - frames >= floor) {

@@ -364,6 +364,9 @@ public:
     bool takePlaybackCredit(int frames) noexcept {
         return driver_.takePlaybackCredit(frames);
     }
+    void chargePlaybackCredit(int frames) noexcept {
+        driver_.chargePlaybackCredit(frames);
+    }
     void injectServiceStallUs(int microseconds) noexcept {
         driver_.injectServiceStallUs(microseconds);
     }
