@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <limits>
 
@@ -70,6 +71,26 @@ constexpr bool isCompleteCaptureQuantum(
 constexpr int kDefaultPeriodMultiplier = 3;
 constexpr int kMinPeriodMultiplier = 1;
 constexpr int kMaxPeriodMultiplier = 8;
+// Milliseconds to poll for until a deadline, rounded up. A deadline shorter
+// than a millisecond used to round to zero and skip the wait entirely: the
+// admission deadline is one quantum period, which at 32 frames is 0.667 ms, so
+// below a 64 frame quantum the target gate never waited and every block went
+// straight to the ceiling test - which is why the ring's operating point did
+// not respond to the target, the headroom or the credit reserve. The poll
+// takes milliseconds, so overshoot is bounded by one of them.
+inline int pollMillisUntil(std::chrono::steady_clock::time_point deadline,
+                           std::chrono::steady_clock::time_point now) noexcept {
+    const auto remainingNs =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
+    if (remainingNs <= 0) return 0;
+    const long long ms = (remainingNs + 999999) / 1000000;
+    return static_cast<int>(ms > 0 ? ms : 1);
+}
+
+inline int pollMillisUntil(std::chrono::steady_clock::time_point deadline) noexcept {
+    return pollMillisUntil(deadline, std::chrono::steady_clock::now());
+}
+
 constexpr int kMinPacketsPerTransfer = 1;
 constexpr int kMaxPacketsPerTransfer = 8;
 

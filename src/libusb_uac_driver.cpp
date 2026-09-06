@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 
@@ -50,6 +51,8 @@ constexpr int kDefaultNumTransfers = 4;
 // Playback backlog is deliberately bounded: target watermark plus one max graph block.
 // 64 KiB covers 2048 frames at the largest supported 8ch/32-bit format.
 constexpr size_t kRingBytes = kPlaybackRingBytes;
+
+
 constexpr size_t kCaptureRingBytes = kPlaybackRingBytes;
 
 
@@ -3286,11 +3289,9 @@ bool LibusbUacDriver::waitForPlaybackCreditUntil(
     while (playbackCredit_.load(std::memory_order_acquire) - frames < floor &&
            streaming_.load(std::memory_order_acquire) &&
            !transportFailed_.load(std::memory_order_acquire)) {
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - std::chrono::steady_clock::now()).count();
+        const int remaining = monotrypt::usb::pollMillisUntil(deadline);
         if (remaining <= 0) break;
-        if (!playbackWake_.poll(static_cast<int>(remaining))) break;
+        if (!playbackWake_.poll(remaining)) break;
     }
     return playbackCredit_.load(std::memory_order_acquire) - frames >= floor;
 }
@@ -3325,11 +3326,9 @@ bool LibusbUacDriver::waitForWritableFramesUntil(
     while (writableToTargetFrames() < frames &&
            streaming_.load(std::memory_order_acquire) &&
            !transportFailed_.load(std::memory_order_acquire)) {
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - std::chrono::steady_clock::now()).count();
+        const int remaining = monotrypt::usb::pollMillisUntil(deadline);
         if (remaining <= 0) break;
-        if (!playbackWake_.poll(static_cast<int>(remaining))) break;
+        if (!playbackWake_.poll(remaining)) break;
     }
     // Falls back to the ceiling on expiry: the producer prefers to sit at the
     // target, but when the deadline is gone publishing into the headroom beats

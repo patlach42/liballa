@@ -626,3 +626,34 @@ TEST(UsbPlaybackPrime, FillsTargetOrExactPacketAndClampsCapacity) {
                   test.expectedPrimeFrames);
     }
 }
+
+// The admission deadline is one quantum period. Converting it to milliseconds
+// by truncation made every deadline under a millisecond read as zero, so the
+// wait returned without waiting and the caller fell through to its ceiling
+// test - which is how the ring's operating point came to ignore the target,
+// the headroom and the credit reserve at the same time. Below a 64 frame
+// quantum that is every single block.
+TEST(PollMillisUntilTest, RoundsASubMillisecondDeadlineUpToOnePoll) {
+    using namespace std::chrono;
+    const auto now = steady_clock::time_point{};
+    // 32 frames at 48 kHz: 666667 ns, which truncation reads as zero.
+    EXPECT_EQ(1, monotrypt::usb::pollMillisUntil(now + nanoseconds(666667), now));
+    EXPECT_EQ(1, monotrypt::usb::pollMillisUntil(now + nanoseconds(1), now));
+    EXPECT_EQ(1, monotrypt::usb::pollMillisUntil(now + microseconds(999), now));
+}
+
+TEST(PollMillisUntilTest, RoundsUpRatherThanDownAboveAMillisecond) {
+    using namespace std::chrono;
+    const auto now = steady_clock::time_point{};
+    // 64 frames at 48 kHz: 1333334 ns. Truncation gives one poll and loses a
+    // third of the budget; rounding up spends the whole of it.
+    EXPECT_EQ(2, monotrypt::usb::pollMillisUntil(now + nanoseconds(1333334), now));
+    EXPECT_EQ(1, monotrypt::usb::pollMillisUntil(now + milliseconds(1), now));
+}
+
+TEST(PollMillisUntilTest, ReportsNothingLeftOnAPassedDeadline) {
+    using namespace std::chrono;
+    const auto now = steady_clock::time_point{};
+    EXPECT_EQ(0, monotrypt::usb::pollMillisUntil(now, now));
+    EXPECT_EQ(0, monotrypt::usb::pollMillisUntil(now - milliseconds(1), now));
+}
