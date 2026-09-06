@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstring>
 #include <chrono>
+#include <cmath>
 #include <utility>
 #include <cerrno>
 #include <poll.h>
@@ -44,14 +45,8 @@ constexpr uint8_t FORMAT_TYPE_I         = 0x01;
 constexpr uint8_t REQ_SET_CUR              = 0x01;
 constexpr uint16_t CS_SAM_FREQ_CONTROL_SEL = 0x01;
 
-// The iD4 profile keeps the same 4 ms kernel runway as eight 0.5 ms batches.
-// Short completion intervals reduce steady-state queue granularity; exact
-// rational frame accounting avoids the conservative max-packet floor.
+// Generic transfer geometry is derived from endpoint timing below.
 constexpr int kDefaultNumTransfers = 4;
-constexpr int kId4NumTransfers = 8;
-constexpr int kId4PacketsPerTransfer = 4;
-constexpr uint16_t kAudientVendorId = 0x2708;
-constexpr uint16_t kAudientId4ProductId = 0x0009;
 // Playback backlog is deliberately bounded: target watermark plus one max graph block.
 // 64 KiB covers 2048 frames at the largest supported 8ch/32-bit format.
 constexpr size_t kRingBytes = kPlaybackRingBytes;
@@ -95,37 +90,17 @@ void subtractQueued(std::atomic<uint64_t>& value, uint64_t amount) noexcept {
     }
 }
 
-uint64_t monotonicNowNs() noexcept {
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-}
 } // namespace
-void signalWakeFd(int fd) noexcept {
-    if (fd < 0) return;
-    eventfd_t one = 1;
-    (void)eventfd_write(fd, one);
-}
-void drainWakeFd(int fd) noexcept {
-    if (fd < 0) return;
-    eventfd_t value = 0;
-    while (eventfd_read(fd, &value) == 0) {}
-}
-bool pollWakeFd(int fd, int timeoutMs) noexcept {
-    if (fd < 0) return false;
-    pollfd pfd{fd, POLLIN, 0};
-    int result;
-    do { result = poll(&pfd, 1, timeoutMs); } while (result < 0 && errno == EINTR);
-    return result > 0;
-}
 
 LibusbUacDriver::LibusbUacDriver() {
     ring_.resize(kRingBytes);
     ringMask_ = kRingBytes - 1;
     captureRing_.resize(kCaptureRingBytes);
     captureRingMask_ = kCaptureRingBytes - 1;
-    captureWakeFd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    captureWake_.open();
+    playbackWake_.open();
 }
+
 LibusbUacDriver::~LibusbUacDriver() {
     stop();
     close();
@@ -148,10 +123,8 @@ LibusbUacDriver::~LibusbUacDriver() {
         stop();
         close();
     }
-    if (captureWakeFd_ >= 0) {
-        ::close(captureWakeFd_);
-        captureWakeFd_ = -1;
-    }
+    captureWake_.close();
+    playbackWake_.close();
     std::lock_guard<std::mutex> lock(mutex_);
     if (ctx_) {
         libusb_exit(ctx_);
@@ -245,11 +218,11 @@ bool LibusbUacDriver::open(int fileDescriptor, int driverCode) {
     device_ = handle;
     if (driverCode != 0 && driverCode != 1) { libusb_close(device_); device_ = nullptr; fd_ = -1; return false; }
     driverCode_ = driverCode;
+    line6Profile_ = driverCode_ == 1;
     fd_ = fileDescriptor;
     libusb_device_descriptor descriptor{};
     const int descriptorResult = libusb_get_device_descriptor(
         libusb_get_device(device_), &descriptor);
-    line6Profile_ = driverCode_ == 1;
     if (line6Profile_ && (descriptorResult != LIBUSB_SUCCESS ||
         descriptor.idVendor != 0x0e41 ||
         (descriptor.idProduct != 0x4141 && descriptor.idProduct != 0x4150 && descriptor.idProduct != 0x5555))) {
@@ -257,17 +230,13 @@ bool LibusbUacDriver::open(int fileDescriptor, int driverCode) {
         lastErrorDetail_ = "Line6 driver requires Line6 UX1 VID/PID 0e41:[4141,4150,5555]";
         libusb_close(device_); device_ = nullptr; fd_ = -1; return false;
     }
-    lowLatencyProfile_ = descriptorResult == LIBUSB_SUCCESS &&
-        descriptor.idVendor == kAudientVendorId &&
-        descriptor.idProduct == kAudientId4ProductId;
-    transferCount_ =
-        lowLatencyProfile_ ? kId4NumTransfers : kDefaultNumTransfers;
+    // Transfer count is generic and independent of USB identity.
+    transferCount_ = kDefaultNumTransfers;
     libusb_set_auto_detach_kernel_driver(device_, 1);
-    LOGI("opened device via fd=%d vid=%04x pid=%04x profile=%s",
+    LOGI("opened device via fd=%d vid=%04x pid=%04x",
          fileDescriptor,
          descriptorResult == LIBUSB_SUCCESS ? descriptor.idVendor : 0,
-         descriptorResult == LIBUSB_SUCCESS ? descriptor.idProduct : 0,
-         lowLatencyProfile_ ? "audient-id4-low-latency" : "generic");
+         descriptorResult == LIBUSB_SUCCESS ? descriptor.idProduct : 0);
     return true;
 }
 
@@ -1204,7 +1173,7 @@ bool LibusbUacDriver::start(int sampleRateHz, int bitsPerSample, int channels,
         // on this start (or leave empty if the device returns nothing).
         supportedRates_.clear();
     }
-    if (captureWakeFd_ < 0) {
+    if (!captureWake_.valid() || !playbackWake_.valid()) {
         err(StartError::IsoPumpAllocFailed,
             "eventfd creation failed: " + std::string(std::strerror(errno)));
         return false;
@@ -1244,6 +1213,7 @@ bool LibusbUacDriver::start(int sampleRateHz, int bitsPerSample, int channels,
         captureOverruns_.store(0, std::memory_order_relaxed);
         metadataFifoOverruns_.store(0, std::memory_order_relaxed);
         captureUnderruns_.store(0, std::memory_order_relaxed);
+        capturePacketDrops_.store(0, std::memory_order_relaxed);
         streaming_.store(false, std::memory_order_release);
     }
 
@@ -1353,8 +1323,32 @@ bool LibusbUacDriver::start(int sampleRateHz, int bitsPerSample, int channels,
     playbackUnderruns_.store(0, std::memory_order_relaxed);
     playbackOverrunActive_.store(false, std::memory_order_relaxed);
     playbackUnderrunActive_.store(false, std::memory_order_relaxed);
-    playbackSilentPackets_.store(0, std::memory_order_relaxed);
-    playbackSilentFrames_.store(0, std::memory_order_relaxed);
+    playbackShortPackets_.store(0, std::memory_order_relaxed);
+    playbackShortFrames_.store(0, std::memory_order_relaxed);
+    deferredNoMetadata_.store(0, std::memory_order_relaxed);
+    transferDiscontinuities_.store(0, std::memory_order_relaxed);
+    implicitMetadataInvalid_.store(0, std::memory_order_relaxed);
+    deferredNoPcm_.store(0, std::memory_order_relaxed);
+    queuedOutLowWater_.store(std::numeric_limits<uint64_t>::max(),
+                             std::memory_order_relaxed);
+    ringLowWater_.store(std::numeric_limits<uint64_t>::max(),
+                        std::memory_order_relaxed);
+    playbackCredit_.store(0, std::memory_order_relaxed);
+    lastCompletionNs_ = 0;
+    maxCompletionGapNs_.store(0, std::memory_order_relaxed);
+    serviceGapCount_.store(0, std::memory_order_relaxed);
+    worstGapInflight_.store(-1, std::memory_order_relaxed);
+    worstGapPending_.store(-1, std::memory_order_relaxed);
+    worstGapRing_.store(-1, std::memory_order_relaxed);
+    maxMissingDrains_.store(0, std::memory_order_relaxed);
+    drainFramesMin_.store(std::numeric_limits<uint64_t>::max(),
+                          std::memory_order_relaxed);
+    drainFramesMax_.store(0, std::memory_order_relaxed);
+    writesSinceDrain_.store(0, std::memory_order_relaxed);
+    maxWritesBetweenDrains_.store(0, std::memory_order_relaxed);
+    for (auto& bucket : ringOccupancy_) bucket.store(0, std::memory_order_relaxed);
+    ringOccupancySamples_.store(0, std::memory_order_relaxed);
+    ringHighWater_.store(0, std::memory_order_relaxed);
     playbackStarted_.store(false, std::memory_order_relaxed);
     stopRequested_.store(false, std::memory_order_relaxed);
     transportFailed_.store(false, std::memory_order_relaxed);
@@ -1432,18 +1426,20 @@ bool LibusbUacDriver::line6StartDuplex() {
     if (!ensureEventThread()) return fail(StartError::IsoPumpAllocFailed, "Line6 UX1 event thread failed");
     if (!startCapturePump()) return fail(StartError::IsoPumpAllocFailed, "Line6 UX1 capture pump failed");
     const int startupPacketsPerSecond = packetsPerSecondForInterval(format_.isHighSpeed, format_.bInterval);
-    const int startupPacketsPerTransfer = lowLatencyProfile_ && startupPacketsPerSecond >= 8000
-        ? kId4PacketsPerTransfer : packetsPerTransferForRate(startupPacketsPerSecond);
+    const int startupPacketsPerTransfer = packetsPerTransferForRate(startupPacketsPerSecond);
     const size_t required = static_cast<size_t>(transferCount_) * static_cast<size_t>(startupPacketsPerTransfer);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    const WakeChannel::Registration priming(captureWake_);
     while (implicitWrite_.load(std::memory_order_acquire) - implicitRead_.load(std::memory_order_acquire) < required &&
            !stopRequested_.load(std::memory_order_acquire)) {
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
-        if (remaining <= 0 || !pollWakeFd(captureWakeFd_, static_cast<int>(remaining))) break;
-        drainWakeFd(captureWakeFd_);
+        if (remaining <= 0 || !captureWake_.poll(static_cast<int>(remaining))) break;
+        captureWake_.drain();
     }
-    if (implicitWrite_.load(std::memory_order_acquire) - implicitRead_.load(std::memory_order_acquire) < required)
-        return fail(StartError::IsoPumpSubmitFailed, "implicit-feedback capture did not prime output within 50 ms");
+    if (implicitWrite_.load(std::memory_order_acquire) -
+            implicitRead_.load(std::memory_order_acquire) < required)
+        return fail(StartError::IsoPumpSubmitFailed,
+                    "implicit-feedback capture did not prime output within 50 ms");
     if (!startIsoPump(false)) return fail(StartError::IsoPumpSubmitFailed, "Line6 UX1 playback pump failed");
     streaming_.store(true, std::memory_order_release);
     return true;
@@ -1636,6 +1632,7 @@ bool LibusbUacDriver::startDuplex(int sampleRateHz, int bitsPerSample,
                     captureTail_.store(0, std::memory_order_relaxed);
                     captureOverruns_.store(0, std::memory_order_relaxed);
                     captureUnderruns_.store(0, std::memory_order_relaxed);
+                    capturePacketDrops_.store(0, std::memory_order_relaxed);
                     captureSequence_.store(0, std::memory_order_relaxed);
                     implicitRead_.store(0, std::memory_order_relaxed);
                     implicitWrite_.store(0, std::memory_order_relaxed);
@@ -1661,35 +1658,22 @@ bool LibusbUacDriver::startDuplex(int sampleRateHz, int bitsPerSample,
             // Capture completions provide the packet clock. Drive them before
             // submitting OUT transfers, then require enough metadata to size
             // every initially queued packet without a nominal fallback.
-            eventThread_ = std::thread([this]() {
-                eventThreadTid_.store(
-                    static_cast<int32_t>(guitarrackcraft::getTid()),
-                    std::memory_order_release);
-                eventThreadUrgentAudio_.store(
-                    guitarrackcraft::setCurrentThreadUrgentAudio("UsbIsoEvents"),
-                    std::memory_order_release);
-                while (!stopRequested_.load(std::memory_order_acquire)) {
-                    timeval tv{0, 100000};
-                    libusb_handle_events_timeout(ctx_, &tv);
-                }
-                eventThreadTid_.store(0, std::memory_order_release);
-            });
+            eventThread_ = std::thread([this]() { runEventLoop(); });
             const int startupPacketsPerSecond = packetsPerSecondForInterval(
                 format_.isHighSpeed, format_.bInterval);
             const int startupPacketsPerTransfer =
-                lowLatencyProfile_ && startupPacketsPerSecond >= 8000
-                    ? kId4PacketsPerTransfer
-                    : packetsPerTransferForRate(startupPacketsPerSecond);
+                packetsPerTransferForRate(startupPacketsPerSecond);
             const size_t required = static_cast<size_t>(transferCount_) *
                                     static_cast<size_t>(startupPacketsPerTransfer);
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+            const WakeChannel::Registration priming(captureWake_);
             while (implicitWrite_.load(std::memory_order_acquire) -
                        implicitRead_.load(std::memory_order_acquire) < required &&
                    !stopRequested_.load(std::memory_order_acquire)) {
                 const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                     deadline - std::chrono::steady_clock::now()).count();
-                if (remaining <= 0 || !pollWakeFd(captureWakeFd_, static_cast<int>(remaining))) break;
-                drainWakeFd(captureWakeFd_);
+                if (remaining <= 0 || !captureWake_.poll(static_cast<int>(remaining))) break;
+                captureWake_.drain();
             }
             if (implicitWrite_.load(std::memory_order_acquire) -
                     implicitRead_.load(std::memory_order_acquire) < required) {
@@ -1737,9 +1721,7 @@ bool LibusbUacDriver::startCapturePump() {
         captureFormat_.isHighSpeed, captureFormat_.bInterval);
     capturePacketsPerTransfer_ = userspaceBufferConfig_.packetsPerTransfer != 0
         ? userspaceBufferConfig_.packetsPerTransfer
-        : (lowLatencyProfile_ && capturePacketsPerSecond >= 8000
-            ? kId4PacketsPerTransfer
-            : packetsPerTransferForRate(capturePacketsPerSecond));
+        : packetsPerTransferForRate(capturePacketsPerSecond);
     const int packets = capturePacketsPerTransfer_;
     const int captureNominalMax =
         (captureFormat_.sampleRateHz + capturePacketsPerSecond - 1) /
@@ -1824,7 +1806,10 @@ void LibusbUacDriver::markTransportFailed() noexcept {
     captureActive_.store(false, std::memory_order_release);
     streaming_.store(false, std::memory_order_release);
     stopRequested_.store(true, std::memory_order_release);
-    signalWakeFd(captureWakeFd_);
+    // Terminal transition: wake both channels unconditionally so no waiter
+    // can miss the failure while the gate below is being observed.
+    captureWake_.signal();
+    playbackWake_.signal();
 }
 
 void LibusbUacDriver::onCapture(libusb_transfer* xfr) {
@@ -1843,8 +1828,6 @@ void LibusbUacDriver::onCapture(libusb_transfer* xfr) {
         markTransportFailed();
         return;
     }
-    if (xfr->status != LIBUSB_TRANSFER_COMPLETED)
-        captureTransferErrors_.fetch_add(1, std::memory_order_relaxed);
 
     size_t head = captureHead_.load(std::memory_order_relaxed);
     const size_t tail = captureTail_.load(std::memory_order_acquire);
@@ -1859,10 +1842,17 @@ void LibusbUacDriver::onCapture(libusb_transfer* xfr) {
                               pkt.status == LIBUSB_TRANSFER_COMPLETED &&
                               n > 0 && stride > 0;
         if (!packetOk)
-            captureTransferErrors_.fetch_add(1, std::memory_order_relaxed);
+            capturePacketDrops_.fetch_add(1, std::memory_order_relaxed);
         const bool implicit = captureFormat_.implicitFeedback &&
                               format_.feedbackEndpointAddress == 0;
         if (implicit) {
+            // A failed or empty capture packet carries no clock information.
+            // Writing zero here is not a measurement of what the device
+            // consumed, so it is counted as the integrity event it is; the
+            // startup prime refuses to build a packet plan out of these.
+            if (!packetOk) {
+                implicitMetadataInvalid_.fetch_add(1, std::memory_order_relaxed);
+            }
             const uint16_t packetFrames =
                 packetOk ? static_cast<uint16_t>(n / stride) : 0;
             const size_t write =
@@ -1903,8 +1893,13 @@ void LibusbUacDriver::onCapture(libusb_transfer* xfr) {
         captureSequence_.fetch_add(static_cast<uint64_t>(totalFrames),
                                    std::memory_order_release);
 
+    flightRecorder_.record(
+        PacketFlightRecorder::Event::CaptureComplete, monotonicNowNs(),
+        static_cast<uint32_t>(totalFrames), 0,
+        static_cast<uint32_t>(bufferedFrames()),
+        static_cast<uint32_t>(queuedOutFrames_.load(std::memory_order_relaxed)));
     submitPendingImplicitTransfers();
-    signalWakeFd(captureWakeFd_);
+    captureWake_.signalIfWaiting();
     if (transportFailed_.load(std::memory_order_acquire)) {
         captureInflight_.fetch_sub(1, std::memory_order_acq_rel);
         return;
@@ -2050,6 +2045,7 @@ int LibusbUacDriver::captureAvailableFrames() const {
 }
 bool LibusbUacDriver::waitForCaptureFrames(int frames, int timeoutMs) const {
     if (frames <= 0) return true;
+    const WakeChannel::Registration waiting(captureWake_);
     const auto deadline = timeoutMs > 0
         ? std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs)
         : std::chrono::steady_clock::time_point::max();
@@ -2062,8 +2058,20 @@ bool LibusbUacDriver::waitForCaptureFrames(int frames, int timeoutMs) const {
             if (remaining <= 0) break;
             waitMs = static_cast<int>(remaining);
         }
-        if (!pollWakeFd(captureWakeFd_, waitMs)) break;
-        drainWakeFd(captureWakeFd_);
+        if (!captureWake_.poll(waitMs)) break;
+        captureWake_.drain();
+    }
+    return captureAvailableFrames() >= frames;
+}
+
+bool LibusbUacDriver::waitForCaptureFramesUntil(
+        int frames, std::chrono::steady_clock::time_point deadline) const {
+    if (frames <= 0) return true;
+    const WakeChannel::Registration waiting(captureWake_);
+    while (captureAvailableFrames() < frames &&
+           streaming_.load(std::memory_order_acquire)) {
+        if (!captureWake_.pollUntil(deadline)) break;
+        captureWake_.drain();
     }
     return captureAvailableFrames() >= frames;
 }
@@ -2098,7 +2106,8 @@ void LibusbUacDriver::requestStop() noexcept {
     stopRequested_.store(true, std::memory_order_release);
     captureActive_.store(false, std::memory_order_release);
     streaming_.store(false, std::memory_order_release);
-    signalWakeFd(captureWakeFd_);
+    captureWake_.signal();
+    playbackWake_.signal();
 }
 void LibusbUacDriver::stop() {
     std::lock_guard<std::recursive_mutex> sessionLock(sessionMutex_);
@@ -2135,26 +2144,111 @@ void LibusbUacDriver::stop() {
     captureSequence_.store(0, std::memory_order_relaxed);
     metadataFifoOverruns_.store(0, std::memory_order_relaxed);
     captureUnderruns_.store(0, std::memory_order_relaxed);
+    capturePacketDrops_.store(0, std::memory_order_relaxed);
     LOGI("stopped streaming (full teardown)");
 }
 
 // --- Iso pump ---------------------------------------------------------
 
+namespace {
+
+// The servicing thread's own cumulative runqueue wait, from
+// /proc/self/task/<tid>/schedstat. Opened once and read with pread, and only
+// while a measurement asks for it: this is a procfs read on the thread whose
+// timeliness is the subject, so it is off by default.
+class RunqueueWaitFd {
+public:
+    void openForCurrentThread() noexcept {
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/self/task/%d/schedstat",
+                      static_cast<int>(guitarrackcraft::getTid()));
+        fd_ = ::open(path, O_RDONLY | O_CLOEXEC);
+    }
+    ~RunqueueWaitFd() { if (fd_ >= 0) ::close(fd_); }
+    uint64_t waitNs() const noexcept {
+        if (fd_ < 0) return 0;
+        char buf[96];
+        const ssize_t n = ::pread(fd_, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) return 0;
+        buf[n] = '\0';
+        const char* p = buf;
+        while (*p == ' ') ++p;
+        while (*p >= '0' && *p <= '9') ++p;
+        while (*p == ' ') ++p;
+        uint64_t wait = 0;
+        if (!(*p >= '0' && *p <= '9')) return 0;
+        while (*p >= '0' && *p <= '9') {
+            wait = wait * 10 + static_cast<uint64_t>(*p - '0');
+            ++p;
+        }
+        return wait;
+    }
+
+private:
+    int fd_ = -1;
+};
+
+}  // namespace
+
+// One event loop, called from both places a servicing thread is started. They
+// were separate copies of the same body, which is how the first attempt at
+// instrumenting it measured the thread this device does not use.
+void LibusbUacDriver::runEventLoop() {
+    eventThreadTid_.store(static_cast<int32_t>(guitarrackcraft::getTid()),
+                          std::memory_order_release);
+    eventThreadUrgentAudio_.store(
+        guitarrackcraft::setCurrentThreadUrgentAudio(
+            "UsbIsoEvents", guitarrackcraft::AudioCpuRole::Service),
+        std::memory_order_release);
+    RunqueueWaitFd runqueue;
+    const bool measureRunqueue =
+        measureServiceRunqueue_.load(std::memory_order_relaxed);
+    if (measureRunqueue) runqueue.openForCurrentThread();
+    while (!stopRequested_.load(std::memory_order_acquire)) {
+        timeval tv{0, 100000};
+        callbacksThisPoll_.store(0, std::memory_order_relaxed);
+        const uint64_t runqueueBefore = measureRunqueue ? runqueue.waitNs() : 0;
+        const auto pollBegan = std::chrono::steady_clock::now();
+        libusb_handle_events_timeout(ctx_, &tv);
+        // How many completions one wakeup collected. This is what tells a late
+        // collection from a quiet bus: a gap ending with six callbacks at once
+        // means the device had delivered all six and nothing was there to take
+        // them, while a gap ending with one means there was nothing to take.
+        // The gap alone cannot say which, and neither can the callback's own
+        // off-CPU time, which is tens of microseconds while gaps are
+        // milliseconds.
+        const uint32_t collected =
+            callbacksThisPoll_.load(std::memory_order_relaxed);
+        uint32_t worst = maxCallbacksPerPoll_.load(std::memory_order_relaxed);
+        while (collected > worst &&
+               !maxCallbacksPerPoll_.compare_exchange_weak(
+                   worst, collected, std::memory_order_relaxed)) {}
+        // The discriminator. An iteration that collects several completions at
+        // once followed a gap; the question is what the thread was doing
+        // through it. If its runqueue wait grew by about the gap, it was
+        // runnable and not given a CPU. If it did not grow, it was never made
+        // runnable - the completions were ready and the wakeup did not come.
+        if (measureRunqueue && collected > 1) {
+            const uint64_t waitedNs = runqueue.waitNs() > runqueueBefore
+                ? runqueue.waitNs() - runqueueBefore : 0;
+            const uint64_t spanNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - pollBegan).count());
+            uint64_t worstSpan =
+                worstMultiCollectSpanNs_.load(std::memory_order_relaxed);
+            if (spanNs > worstSpan) {
+                worstMultiCollectSpanNs_.store(spanNs, std::memory_order_relaxed);
+                worstMultiCollectRunqueueNs_.store(waitedNs,
+                                                   std::memory_order_relaxed);
+            }
+        }
+    }
+    eventThreadTid_.store(0, std::memory_order_release);
+}
+
 bool LibusbUacDriver::ensureEventThread() {
     if (eventThread_.joinable()) return true;
-    eventThread_ = std::thread([this]() {
-        eventThreadTid_.store(
-            static_cast<int32_t>(guitarrackcraft::getTid()),
-            std::memory_order_release);
-        eventThreadUrgentAudio_.store(
-            guitarrackcraft::setCurrentThreadUrgentAudio("UsbIsoEvents"),
-            std::memory_order_release);
-        while (!stopRequested_.load(std::memory_order_acquire)) {
-            timeval tv{0, 100000};
-            libusb_handle_events_timeout(ctx_, &tv);
-        }
-        eventThreadTid_.store(0, std::memory_order_release);
-    });
+    eventThread_ = std::thread([this]() { runEventLoop(); });
     return true;
 }
 
@@ -2182,9 +2276,12 @@ bool LibusbUacDriver::startIsoPump(bool submit) {
         std::max(1, hostPeriodHz / packetIntervalUframes_);
     playbackPacketsPerTransfer_ = userspaceBufferConfig_.packetsPerTransfer != 0
         ? userspaceBufferConfig_.packetsPerTransfer
-        : (lowLatencyProfile_ && microframesPerSec_ >= 8000
-            ? kId4PacketsPerTransfer
-            : packetsPerTransferForRate(microframesPerSec_));
+        : packetsPerTransferForRate(microframesPerSec_);
+    // One transfer's nominal duration, the unit a completion gap is counted in.
+    nominalTransferNs_ = format_.sampleRateHz > 0
+        ? static_cast<int>(static_cast<int64_t>(playbackPacketsPerTransfer_) *
+                           1000000000LL / microframesPerSec_)
+        : 0;
     int baseFrames = format_.sampleRateHz / microframesPerSec_;
     int rateRemainder = format_.sampleRateHz % microframesPerSec_;
     LOGI("iso pump: %d packets/sec (HS=%d, bInterval=%u), "
@@ -2280,6 +2377,13 @@ bool LibusbUacDriver::startIsoPump(bool submit) {
                     if (implicitRead_.compare_exchange_weak(
                             read, read + 1, std::memory_order_acq_rel,
                             std::memory_order_acquire)) {
+                        // An entry of zero frames comes from a capture packet
+                        // that failed or arrived empty, so it carries no clock
+                        // information. Priming a descriptor from it plans a
+                        // zero-length packet and halves the initial geometry:
+                        // four transfers primed 96 frames where the nominal is
+                        // 192. Consume it and take the next valid entry.
+                        if (frames <= 0) continue;
                         xfr->iso_packet_desc[packet].length =
                             frames * frameStride;
                         break;
@@ -2301,9 +2405,10 @@ bool LibusbUacDriver::startIsoPump(bool submit) {
     const int maxPrime = std::max(0, physicalFrames -
                                       graphQuantum_.load(std::memory_order_acquire));
     startupPrimeFrames_.store(
-        startupPlaybackPrimeFrames(maxPrime, exactInitialPacketFrames_,
-        playbackTargetFrames_.load(std::memory_order_acquire),
-        graphQuantum_.load(std::memory_order_acquire)),
+        startupPlaybackPrimeFrames(
+            maxPrime,
+            exactInitialPacketFrames_,
+            playbackTargetFrames_.load(std::memory_order_acquire)),
         std::memory_order_release);
 
     // Optional feedback EP. UAC2 §5.2.2.4.1: feedback IN, 4 bytes
@@ -2361,6 +2466,9 @@ bool LibusbUacDriver::submitIsoPump() {
     };
     // All initial packet payloads are filled before the first submit.
     const int stride = format_.channels * format_.bytesPerSample;
+    LOGI("iso prime: transfers=%zu exact_initial=%d prime=%d buffered=%d stride=%d",
+         transfers_.size(), exactInitialPacketFrames_, startupPrimeFrames(),
+         bufferedFrames(), stride);
     if (stride <= 0 || startupPrimeFrames() > bufferedFrames()) {
         LOGE("playback submit rejected: stride=%d prime=%d buffered=%d",
              stride, startupPrimeFrames(), bufferedFrames());
@@ -2372,7 +2480,12 @@ bool LibusbUacDriver::submitIsoPump() {
         size_t offset = 0;
         for (int packet = 0; packet < xfr->num_iso_packets; ++packet) {
             const int bytes = static_cast<int>(xfr->iso_packet_desc[packet].length);
-            drainRing(xfr->buffer + offset, bytes);
+            // The prime check above guarantees the whole set is covered, so a
+            // short drain here means that invariant broke. Ship what exists
+            // rather than whatever the buffer happened to hold.
+            const int drained = drainRing(xfr->buffer + offset, bytes);
+            xfr->iso_packet_desc[packet].length =
+                static_cast<unsigned int>(drained < 0 ? 0 : drained);
             offset += static_cast<size_t>(bytes);
         }
     }
@@ -2440,7 +2553,29 @@ bool LibusbUacDriver::stopIsoPump() {
 }
 
 void LibusbUacDriver::onIsoTrampoline(libusb_transfer* xfr) {
-    static_cast<LibusbUacDriver*>(xfr->user_data)->onIso(xfr);
+    auto* self = static_cast<LibusbUacDriver*>(xfr->user_data);
+    self->callbacksThisPoll_.fetch_add(1, std::memory_order_relaxed);
+    // The render thread has had an off-CPU figure for a while; servicing has
+    // not, and servicing is the half that the submitted runway exists to
+    // cover. Same subtraction: wall time the callback took, minus the CPU time
+    // it used, is the callback being descheduled halfway through resubmitting
+    // a transfer the device is already waiting on.
+    const uint64_t cpuBegan = guitarrackcraft::threadCpuNanoseconds();
+    const auto wallBegan = std::chrono::steady_clock::now();
+    self->onIso(xfr);
+    if (cpuBegan != 0) {
+        const uint64_t wallNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wallBegan).count());
+        const uint64_t cpuNs =
+            guitarrackcraft::threadCpuNanoseconds() - cpuBegan;
+        const uint64_t offCpuNs = wallNs > cpuNs ? wallNs - cpuNs : 0;
+        uint64_t worst = self->worstServiceOffCpuNs_.load(
+            std::memory_order_relaxed);
+        while (worst < offCpuNs &&
+               !self->worstServiceOffCpuNs_.compare_exchange_weak(
+                   worst, offCpuNs, std::memory_order_relaxed)) {}
+    }
 }
 
 void LibusbUacDriver::onFeedbackTrampoline(libusb_transfer* xfr) {
@@ -2513,7 +2648,18 @@ bool LibusbUacDriver::prepareImplicitTransfer(libusb_transfer* xfr) {
     size_t read = implicitRead_.load(std::memory_order_acquire);
     for (;;) {
         const size_t write = implicitWrite_.load(std::memory_order_acquire);
-        if (write < read || write - read < count) return false;
+        if (write < read || write - read < count) {
+            deferredNoMetadata_.fetch_add(1, std::memory_order_relaxed);
+            flightRecorder_.record(
+                PacketFlightRecorder::Event::DeferredNoMetadata,
+                monotonicNowNs(),
+                static_cast<uint32_t>(write < read ? 0 : write - read),
+                static_cast<uint32_t>(count),
+                static_cast<uint32_t>(bufferedFrames()),
+                static_cast<uint32_t>(
+                    queuedOutFrames_.load(std::memory_order_relaxed)));
+            return false;
+        }
         int transferFrames = 0;
         for (size_t packet = 0; packet < count; ++packet) {
             frameCounts[packet] = std::min<int>(
@@ -2526,7 +2672,18 @@ bool LibusbUacDriver::prepareImplicitTransfer(libusb_transfer* xfr) {
         // A completed OUT transfer still has the other in-flight URBs in
         // front of it. Defer resubmission until rendered PCM is ready instead
         // of committing audible silence several milliseconds early.
-        if (bufferedFrames() < transferFrames) return false;
+        const int buffered = bufferedFrames();
+        if (buffered < transferFrames) {
+            deferredNoPcm_.fetch_add(1, std::memory_order_relaxed);
+            flightRecorder_.record(
+                PacketFlightRecorder::Event::DeferredNoPcm, monotonicNowNs(),
+                static_cast<uint32_t>(buffered < 0 ? 0 : buffered),
+                static_cast<uint32_t>(transferFrames),
+                static_cast<uint32_t>(buffered < 0 ? 0 : buffered),
+                static_cast<uint32_t>(
+                    queuedOutFrames_.load(std::memory_order_relaxed)));
+            return false;
+        }
         if (implicitRead_.compare_exchange_weak(
                 read, read + count, std::memory_order_acq_rel,
                 std::memory_order_acquire)) {
@@ -2541,7 +2698,14 @@ bool LibusbUacDriver::prepareImplicitTransfer(libusb_transfer* xfr) {
         if (bytes > 0) {
             uint8_t* packetBuffer = libusb_get_iso_packet_buffer(
                 xfr, static_cast<unsigned int>(packet));
-            drainRing(packetBuffer, bytes);
+            // prepareImplicitTransfer only reaches this point with the whole
+            // transfer's frames present, and this callback is the ring's only
+            // consumer, so a short drain is an invariant failure rather than
+            // an underrun. Shorten the packet regardless: the contract is that
+            // nothing but rendered PCM ever leaves.
+            const int drained = drainRing(packetBuffer, bytes);
+            xfr->iso_packet_desc[packet].length =
+                static_cast<unsigned int>(drained < 0 ? 0 : drained);
         }
     }
     return true;
@@ -2616,6 +2780,89 @@ void LibusbUacDriver::onIso(libusb_transfer* xfr) {
         }
     }
 
+    // Sampled here rather than at the subtraction above: stop() zeroes the
+    // queue on purpose and the cancellations that follow would otherwise
+    // record that zero as if the runway had run dry mid-stream.
+    // Fires once per arming, inside the completion path, which is precisely
+    // where a real service pause hurts: completions stop being processed, the
+    // ring stops draining, and capture URBs are not resubmitted.
+    if (const int stallUs = serviceStallUs_.exchange(0, std::memory_order_relaxed);
+        stallUs > 0) {
+        const uint64_t until = monotonicNowNs() +
+            static_cast<uint64_t>(stallUs) * 1000ull;
+        while (monotonicNowNs() < until) {}
+        serviceStallsFired_.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (playbackStarted_.load(std::memory_order_acquire)) {
+        const uint64_t now = monotonicNowNs();
+        if (lastCompletionNs_ != 0 && now > lastCompletionNs_) {
+            const uint64_t gap = now - lastCompletionNs_;
+            uint64_t worst = maxCompletionGapNs_.load(std::memory_order_relaxed);
+            const bool isWorst = gap > worst;
+            while (gap > worst &&
+                   !maxCompletionGapNs_.compare_exchange_weak(
+                       worst, gap, std::memory_order_relaxed)) {}
+            if (isWorst) {
+                worstGapInflight_.store(
+                    inflight_.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+                worstGapPending_.store(
+                    static_cast<int>(pendingImplicitCount_),
+                    std::memory_order_relaxed);
+                worstGapRing_.store(bufferedFrames(), std::memory_order_relaxed);
+            }
+            if (nominalTransferNs_ > 0 &&
+                gap > 2ull * static_cast<uint64_t>(nominalTransferNs_)) {
+                serviceGapCount_.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (nominalTransferNs_ > 0) {
+                // Drain opportunities the gap spans, counted before this
+                // service rather than after it: the ring had to hold the
+                // writes for all of them. Subtracting the completion that
+                // ended the gap undercounts the debt the headroom must absorb.
+                const uint64_t extra =
+                    gap / static_cast<uint64_t>(nominalTransferNs_);
+                uint64_t worstMissing =
+                    maxMissingDrains_.load(std::memory_order_relaxed);
+                while (extra > worstMissing &&
+                       !maxMissingDrains_.compare_exchange_weak(
+                           worstMissing, extra, std::memory_order_relaxed)) {}
+            }
+        }
+        lastCompletionNs_ = now;
+        if (completedFrames > 0) {
+            // Played frames are what the producer may spend.
+            playbackCredit_.fetch_add(static_cast<int64_t>(completedFrames),
+                                      std::memory_order_acq_rel);
+            uint64_t lowest = drainFramesMin_.load(std::memory_order_relaxed);
+            while (completedFrames < lowest &&
+                   !drainFramesMin_.compare_exchange_weak(
+                       lowest, completedFrames, std::memory_order_relaxed)) {}
+            uint64_t highest = drainFramesMax_.load(std::memory_order_relaxed);
+            while (completedFrames > highest &&
+                   !drainFramesMax_.compare_exchange_weak(
+                       highest, completedFrames, std::memory_order_relaxed)) {}
+        }
+        const uint64_t runway =
+            queuedOutFrames_.load(std::memory_order_acquire);
+        uint64_t low = queuedOutLowWater_.load(std::memory_order_relaxed);
+        while (runway < low &&
+               !queuedOutLowWater_.compare_exchange_weak(
+                   low, runway, std::memory_order_relaxed)) {}
+        // Occupancy right after a drain, which is where the sawtooth bottoms
+        // out; the peak is recorded by the writer.
+        const uint64_t occupancy = static_cast<uint64_t>(std::max(0, bufferedFrames()));
+        const int bucket = std::min<int>(
+            kOccupancyBuckets - 1,
+            static_cast<int>(occupancy / kOccupancyBucketFrames));
+        ringOccupancy_[bucket].fetch_add(1, std::memory_order_relaxed);
+        ringOccupancySamples_.fetch_add(1, std::memory_order_relaxed);
+        uint64_t ringLow = ringLowWater_.load(std::memory_order_relaxed);
+        while (occupancy < ringLow &&
+               !ringLowWater_.compare_exchange_weak(
+                   ringLow, occupancy, std::memory_order_relaxed)) {}
+    }
+
     const bool implicit = captureActive_.load(std::memory_order_acquire) &&
                           captureFormat_.implicitFeedback &&
                           format_.feedbackEndpointAddress == 0;
@@ -2636,6 +2883,13 @@ void LibusbUacDriver::onIso(libusb_transfer* xfr) {
                 pendingImplicitTransfers_[slot] = xfr;
                 pendingImplicitSinceNs_[slot] = monotonicNowNs();
                 deferredTransfers_.fetch_add(1, std::memory_order_relaxed);
+                flightRecorder_.record(
+                    PacketFlightRecorder::Event::TransferDeferred,
+                    monotonicNowNs(),
+                    static_cast<uint32_t>(pendingImplicitCount_), 0,
+                    static_cast<uint32_t>(bufferedFrames()),
+                    static_cast<uint32_t>(
+                        queuedOutFrames_.load(std::memory_order_relaxed)));
                 pendingDepth_.store(pendingImplicitCount_, std::memory_order_release);
                 uint64_t oldHigh = pendingHighWater_.load(std::memory_order_relaxed);
                 while (pendingImplicitCount_ > oldHigh &&
@@ -2667,11 +2921,27 @@ void LibusbUacDriver::onIso(libusb_transfer* xfr) {
             if (bytes > 0) {
                 uint8_t* packetBuffer =
                     libusb_get_iso_packet_buffer(xfr, packet);
-                drainRing(packetBuffer, bytes);
+                // No availability check precedes this path: the packet length
+                // comes from the scheduler or from explicit feedback, not from
+                // what the ring holds. A short drain therefore happens here in
+                // normal operation, and the packet is shortened to match.
+                const int drained = drainRing(packetBuffer, bytes);
+                xfr->iso_packet_desc[packet].length =
+                    static_cast<unsigned int>(drained < 0 ? 0 : drained);
             }
         }
     }
-    signalWakeFd(captureWakeFd_);
+    // An OUT completion frees playback ring space; it never changes capture
+    // availability, so it must not wake capture waiters.
+    // Ring occupancy at completion is the sawtooth we need: the drain chunk
+    // size follows the geometry, and its interaction with the fill quantum is
+    // what decides whether admission is refused.
+    flightRecorder_.record(
+        PacketFlightRecorder::Event::PlaybackComplete, monotonicNowNs(),
+        static_cast<uint32_t>(completedFrames), 0,
+        static_cast<uint32_t>(bufferedFrames()),
+        static_cast<uint32_t>(queuedOutFrames_.load(std::memory_order_relaxed)));
+    playbackWake_.signalIfWaiting();
     const int rc = libusb_submit_transfer(xfr);
     if (rc != LIBUSB_SUCCESS) {
         playbackTransferErrors_.fetch_add(1, std::memory_order_relaxed);
@@ -2692,12 +2962,53 @@ void LibusbUacDriver::onIso(libusb_transfer* xfr) {
 
 // --- Ring buffer ------------------------------------------------------
 
+// Continuity of what actually leaves for the wire. The check at admission sees
+// the float block; this sees the packed subslots after the two-span ring copy,
+// so between them they bracket the packing and the ring.
+void LibusbUacDriver::inspectTransferContinuity(
+        const uint8_t* data, int bytes) noexcept {
+    const float threshold =
+        transferDiscontinuityThreshold_.load(std::memory_order_relaxed);
+    if (threshold <= 0.0f || !flightRecorder_.enabled() || !data) return;
+    const int stride = format_.channels * format_.bytesPerSample;
+    if (stride <= 0 || format_.bytesPerSample != 4) return;
+    constexpr float kScale = 2147483648.0f;
+    for (int offset = 0; offset + stride <= bytes; offset += stride) {
+        int32_t value = 0;
+        std::memcpy(&value, data + offset, sizeof(value));
+        if (transferContinuitySeeded_) {
+            const float step =
+                std::fabs(static_cast<float>(value) -
+                          static_cast<float>(lastTransferSample_)) / kScale;
+            if (step > threshold) {
+                transferDiscontinuities_.fetch_add(1, std::memory_order_relaxed);
+                flightRecorder_.record(
+                    PacketFlightRecorder::Event::TransferDiscontinuity,
+                    monotonicNowNs(),
+                    static_cast<uint32_t>(step * 10000.0f),
+                    static_cast<uint32_t>(offset / stride),
+                    0,
+                    static_cast<uint32_t>(playedFrames_.load(
+                        std::memory_order_relaxed)));
+            }
+        }
+        lastTransferSample_ = value;
+        transferContinuitySeeded_ = true;
+    }
+}
+
 int LibusbUacDriver::drainRing(uint8_t* dst, int bytes) {
     size_t head = ringHead_.load(std::memory_order_acquire);
     size_t tail = ringTail_.load(std::memory_order_relaxed);
     size_t available = head - tail;
     int n = static_cast<int>(std::min<size_t>(available, static_cast<size_t>(bytes)));
     if (n > 0) {
+        // Cleared here rather than in the completion callback: the deferred
+        // path drains the ring from onCapture as well, so a reset tied to
+        // completions counted writes between callbacks instead of between
+        // drains - and five quanta of 64 cannot fit under a 296 frame ceiling,
+        // which is how the miscount showed itself.
+        writesSinceDrain_.store(0, std::memory_order_relaxed);
         size_t off = tail & ringMask_;
         size_t first = std::min<size_t>(n, ring_.size() - off);
         std::memcpy(dst, ring_.data() + off, first);
@@ -2707,29 +3018,49 @@ int LibusbUacDriver::drainRing(uint8_t* dst, int bytes) {
         ringTail_.store(tail + n, std::memory_order_release);
     }
     if (n < bytes) {
-        // Underrun — pad with silence so the iso packet still ships.
-        // The DAC hears a click rather than dropping the entire URB.
-        std::memset(dst + n, 0, bytes - n);
+        // Short of the requested bytes. Nothing is fabricated to cover the
+        // gap: the caller shortens the packet to what was actually drained, so
+        // the device receives only rendered PCM or nothing at all.
+        //
+        // The alternative, padding with silence, keeps the packet at its
+        // scheduled length and so keeps the stream aligned with the device
+        // clock - at the price of inventing samples and of counting them as
+        // played. Under a contract that publishes only complete PCM frames,
+        // the misalignment is the honest failure and the invented audio is
+        // not: one is visible in the counters below, the other is audible and
+        // indistinguishable from real output.
         if (playbackStarted_.load(std::memory_order_acquire) &&
             !playbackUnderrunActive_.exchange(true, std::memory_order_acq_rel)) {
             playbackUnderruns_.fetch_add(1, std::memory_order_relaxed);
         }
         const int frameStride = format_.channels * format_.bytesPerSample;
         if (frameStride > 0) {
-            playbackSilentPackets_.fetch_add(1, std::memory_order_relaxed);
-            playbackSilentFrames_.fetch_add(
+            playbackShortPackets_.fetch_add(1, std::memory_order_relaxed);
+            playbackShortFrames_.fetch_add(
                 static_cast<uint64_t>((bytes - n) / frameStride),
                 std::memory_order_relaxed);
+            // Recorded per packet, not per episode: the underrun counter above
+            // is edge triggered, so it cannot say how many frames were short.
+            // Every field is in frames; the local arithmetic here is in bytes.
+            flightRecorder_.record(
+                PacketFlightRecorder::Event::PlaybackUnderrun, monotonicNowNs(),
+                static_cast<uint32_t>(n / frameStride),
+                static_cast<uint32_t>(bytes / frameStride),
+                static_cast<uint32_t>(available / static_cast<size_t>(frameStride)),
+                static_cast<uint32_t>(
+                    queuedOutFrames_.load(std::memory_order_relaxed)));
         }
     } else {
         playbackUnderrunActive_.store(false, std::memory_order_release);
     }
-    // Frames "played" = frames the pump has dispatched, including the
-    // silence padding (since the device hears those samples too). Used
-    // for accurate position reporting back to ExoPlayer.
+    inspectTransferContinuity(dst, n);
+    // Frames "played" = frames actually handed to the device. A short drain
+    // ships a short packet, so the count follows what was drained rather than
+    // what was scheduled; anything else would report audio that was never
+    // sent.
     int frameStride = format_.channels * format_.bytesPerSample;
     if (frameStride > 0) {
-        playedFrames_.fetch_add(bytes / frameStride, std::memory_order_acq_rel);
+        playedFrames_.fetch_add(n / frameStride, std::memory_order_acq_rel);
     }
     return n;
 }
@@ -2792,6 +3123,16 @@ void LibusbUacDriver::commitPlaybackWrite(
     ringHead_.store(
         region.producerCursor + written, std::memory_order_release);
     writtenFrames_.fetch_add(region.frames, std::memory_order_acq_rel);
+    // The sawtooth peaks right after a write, so this is where the high water
+    // belongs; the completion path records the trough.
+    if (playbackStarted_.load(std::memory_order_acquire)) {
+        const uint64_t occupancy =
+            static_cast<uint64_t>(std::max(0, bufferedFrames()));
+        uint64_t high = ringHighWater_.load(std::memory_order_relaxed);
+        while (occupancy > high &&
+               !ringHighWater_.compare_exchange_weak(
+                   high, occupancy, std::memory_order_relaxed)) {}
+    }
 }
 
 int LibusbUacDriver::writePcm(const uint8_t* data, int frames) {
@@ -2830,9 +3171,7 @@ void LibusbUacDriver::setGraphQuantum(
 bool LibusbUacDriver::configureUserspaceBuffers(
         const UserspaceBufferConfig& config) {
     if (streaming_.load(std::memory_order_acquire) ||
-        playbackStarted_.load(std::memory_order_acquire)) {
-        return false;
-    }
+        playbackStarted_.load(std::memory_order_acquire)) return false;
     const size_t requestedCapacity = config.ringCapacityBytes == 0
         ? kRingBytes : config.ringCapacityBytes;
     if (requestedCapacity < 4096 || requestedCapacity > (1u << 20) ||
@@ -2843,9 +3182,9 @@ bool LibusbUacDriver::configureUserspaceBuffers(
          (config.packetsPerTransfer < kMinPacketsPerTransfer ||
           config.packetsPerTransfer > kMaxPacketsPerTransfer)) ||
         config.playbackTargetFrames < 0 || config.startupPrimeFrames < 0 ||
-        config.writeHeadroomFrames < 0 || config.captureLimitFrames < 0) {
-        return false;
-    }
+        config.writeHeadroomFrames < 0 || config.captureLimitFrames < 0 ||
+        config.captureTargetFrames < 0 || config.captureHeadroomFrames < 0 ||
+        config.captureDeadlineSlackFrames < 0) return false;
     ring_.assign(requestedCapacity, 0);
     captureRing_.assign(requestedCapacity, 0);
     ringMask_ = requestedCapacity - 1;
@@ -2855,9 +3194,7 @@ bool LibusbUacDriver::configureUserspaceBuffers(
     captureHead_.store(0, std::memory_order_release);
     captureTail_.store(0, std::memory_order_release);
     userspaceBufferConfig_ = config;
-    transferCount_ = config.transferCount != 0
-        ? config.transferCount
-        : (lowLatencyProfile_ ? kId4NumTransfers : kDefaultNumTransfers);
+    transferCount_ = config.transferCount != 0 ? config.transferCount : kDefaultNumTransfers;
     return true;
 }
 
@@ -2867,34 +3204,54 @@ void LibusbUacDriver::setUserspaceBufferConfig(
     const auto autoConfig = playbackWatermarkConfig(frames, periodMultiplier);
     const int stride = format_.channels * format_.bytesPerSample;
     const int physicalFrames = stride > 0
-        ? static_cast<int>(ring_.size() / static_cast<size_t>(stride))
-        : 0;
-    const int maxTarget = std::max(0, physicalFrames);
-    const int automaticTarget = autoConfig.targetFrames;
-    const int target = userConfig.playbackTargetFrames == 0
-        ? std::min(maxTarget, automaticTarget)
-        : userConfig.playbackTargetFrames;
+        ? static_cast<int>(ring_.size() / static_cast<size_t>(stride)) : 0;
+    // Frames handed to USB per transfer: the granularity the ring drains at.
+    const int drainChunkFrames = transferCount_ > 0
+        ? exactInitialPacketFrames_ / transferCount_ : 0;
     const int headroom = userConfig.writeHeadroomFrames == 0
-        ? autoConfig.graphQuantum
+        ? automaticWriteHeadroomFrames(autoConfig.graphQuantum, drainChunkFrames)
         : userConfig.writeHeadroomFrames;
+    const int requestedTarget = userConfig.playbackTargetFrames == 0
+        ? autoConfig.targetFrames : userConfig.playbackTargetFrames;
     const int automaticPrime = startupPlaybackPrimeFrames(
-        maxTarget, exactInitialPacketFrames_, target, headroom);
+        physicalFrames, exactInitialPacketFrames_, requestedTarget);
     const int prime = userConfig.startupPrimeFrames == 0
         ? automaticPrime : userConfig.startupPrimeFrames;
-    if (target < 0 || prime < 0 || headroom < 0 ||
-        target + headroom > maxTarget || prime > maxTarget ||
-        prime < exactInitialPacketFrames_) {
+    const int captureWave = std::max(1, captureTransferFrames_.load(
+        std::memory_order_acquire));
+    const int automaticCaptureTarget = captureWave >
+            std::numeric_limits<int>::max() / 2
+        ? std::numeric_limits<int>::max()
+        : captureWave * 2;
+    const int captureTarget = userConfig.captureTargetFrames == 0
+        ? automaticCaptureTarget : userConfig.captureTargetFrames;
+    const int captureHeadroom = userConfig.captureHeadroomFrames == 0
+        ? captureWave : userConfig.captureHeadroomFrames;
+    const int captureSlack = userConfig.captureDeadlineSlackFrames == 0
+        ? captureWave : userConfig.captureDeadlineSlackFrames;
+    const bool valid = checkedFrameBudgetFits(
+        requestedTarget, headroom, 0, physicalFrames) &&
+        prime >= exactInitialPacketFrames_ && prime <= physicalFrames &&
+        checkedFrameBudgetFits(
+            captureWave, captureTarget, captureHeadroom, physicalFrames);
+    if (!valid) {
         playbackTargetFrames_.store(0, std::memory_order_release);
         startupPrimeFrames_.store(0, std::memory_order_release);
         writeHeadroomFrames_.store(0, std::memory_order_release);
         captureLimitFrames_.store(0, std::memory_order_release);
+        captureTargetFrames_.store(0, std::memory_order_release);
+        captureHeadroomFrames_.store(0, std::memory_order_release);
+        captureDeadlineSlackFrames_.store(0, std::memory_order_release);
         return;
     }
     graphQuantum_.store(autoConfig.graphQuantum, std::memory_order_release);
-    playbackTargetFrames_.store(target, std::memory_order_release);
+    playbackTargetFrames_.store(requestedTarget, std::memory_order_release);
     startupPrimeFrames_.store(prime, std::memory_order_release);
     writeHeadroomFrames_.store(headroom, std::memory_order_release);
     captureLimitFrames_.store(userConfig.captureLimitFrames, std::memory_order_release);
+    captureTargetFrames_.store(captureTarget, std::memory_order_release);
+    captureHeadroomFrames_.store(captureHeadroom, std::memory_order_release);
+    captureDeadlineSlackFrames_.store(captureSlack, std::memory_order_release);
 }
 
 
@@ -2915,8 +3272,74 @@ int LibusbUacDriver::writableFrames() const {
     return static_cast<int>(std::min(physicalFree, logicalFree));
 }
 
+bool LibusbUacDriver::waitForPlaybackCreditUntil(
+        int frames, std::chrono::steady_clock::time_point deadline) noexcept {
+    if (frames <= 0) return true;
+    if (!playbackStarted_.load(std::memory_order_acquire)) return true;
+    // Completions grant the credit and signal this channel, so waiting here is
+    // waiting for the device to consume - which is exactly what paces the
+    // producer. A deadline still applies: a device that stops consuming is a
+    // transport failure, not a reason to block the render thread forever.
+    const int64_t floor =
+        -static_cast<int64_t>(playbackCreditReserve_.load(std::memory_order_relaxed));
+    const WakeChannel::Registration waiting(playbackWake_);
+    while (playbackCredit_.load(std::memory_order_acquire) - frames < floor &&
+           streaming_.load(std::memory_order_acquire) &&
+           !transportFailed_.load(std::memory_order_acquire)) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) break;
+        if (!playbackWake_.poll(static_cast<int>(remaining))) break;
+    }
+    return playbackCredit_.load(std::memory_order_acquire) - frames >= floor;
+}
+
+int LibusbUacDriver::writableToTargetFrames() const {
+    const int frameStride = format_.channels * format_.bytesPerSample;
+    if (frameStride <= 0) return 0;
+    const size_t head = ringHead_.load(std::memory_order_relaxed);
+    const size_t tail = ringTail_.load(std::memory_order_acquire);
+    const size_t queued = (head - tail) / static_cast<size_t>(frameStride);
+    // Room measured against the target rather than the admission ceiling.
+    // Admission refuses at target + headroom, so a producer that only stops
+    // when refused settles just under the ceiling and the headroom - meant to
+    // absorb the sawtooth - becomes the working level instead. Measured, the
+    // ring sat at 244-276 against a target of 256 and a ceiling of 296, so a
+    // single late drain exhausted it and a held block had nowhere to return.
+    const int target = playbackStarted_.load(std::memory_order_acquire)
+        ? playbackTargetFrames_.load(std::memory_order_acquire)
+        : startupPrimeFrames_.load(std::memory_order_acquire);
+    if (target <= 0) return writableFrames();
+    const size_t limit = static_cast<size_t>(target);
+    const size_t logicalFree = queued < limit ? limit - queued : 0;
+    const size_t physicalFree =
+        (ring_.size() - (head - tail)) / static_cast<size_t>(frameStride);
+    return static_cast<int>(std::min(physicalFree, logicalFree));
+}
+
+bool LibusbUacDriver::waitForWritableFramesUntil(
+        int frames, std::chrono::steady_clock::time_point deadline) const {
+    if (frames <= 0) return true;
+    const WakeChannel::Registration waiting(playbackWake_);
+    while (writableToTargetFrames() < frames &&
+           streaming_.load(std::memory_order_acquire) &&
+           !transportFailed_.load(std::memory_order_acquire)) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) break;
+        if (!playbackWake_.poll(static_cast<int>(remaining))) break;
+    }
+    // Falls back to the ceiling on expiry: the producer prefers to sit at the
+    // target, but when the deadline is gone publishing into the headroom beats
+    // losing the block.
+    return writableFrames() >= frames;
+}
+
 bool LibusbUacDriver::waitForWritableFrames(int frames, int timeoutMs) const {
     if (frames <= 0) return true;
+    const WakeChannel::Registration waiting(playbackWake_);
     const auto deadline = timeoutMs > 0
         ? std::chrono::steady_clock::now() +
               std::chrono::milliseconds(timeoutMs)
@@ -2932,8 +3355,8 @@ bool LibusbUacDriver::waitForWritableFrames(int frames, int timeoutMs) const {
             if (remaining <= 0) break;
             waitMs = static_cast<int>(remaining);
         }
-        if (!pollWakeFd(captureWakeFd_, waitMs)) break;
-        drainWakeFd(captureWakeFd_);
+        if (!playbackWake_.poll(waitMs)) break;
+        playbackWake_.drain();
     }
     return writableFrames() >= frames;
 }

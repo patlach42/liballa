@@ -15,7 +15,13 @@ PRIMARY_REQUIRED = ("cycle", "state", "failure", "actual_xrun_growth", "capture_
                     "deadline_miss_growth", "last_dsp_ns", "peak_dsp_ns", "last_cycle_ns",
                     "peak_cycle_ns", "deadline_budget_ns", "known_host_latency_frames")
 LIFECYCLE_REQUIRED = ("lifecycle_after_stop", "state", "failure", "lifecycle_failures")
-SUPPORTED_SCHEMAS = frozenset((3, 4, 5, 6, 7))
+SUPPORTED_SCHEMAS = frozenset((3, 4, 5, 6, 7, 8, 9, 10, 11, 12))
+# Schema 8 (commit b01927b) redefined the aggregate xrun total: it now folds in
+# capturePacketDrops and playbackQuantumDrops alongside the playback xruns and
+# capture over/underruns counted by schemas 3-7. The same physical behaviour
+# therefore reports a larger actual_xrun_growth at schema 8 than below it, so
+# runs from both sides of this break must not be compared or pooled.
+AGGREGATE_XRUN_REDEFINED_AT_SCHEMA = 8
 
 
 def parse_value(value):
@@ -96,6 +102,10 @@ def _stable_pass(record):
     peak_cycle = number(record, "peak_cycle_ns")
     if budget is None or budget <= 0 or last_cycle is None or last_cycle <= 0 or host_frames is None or host_frames <= 0 or peak_cycle is None or peak_cycle < last_cycle:
         return False
+    # The certification contract in docs/measurement.md requires zero quantum
+    # drops as well as zero xruns, so the aggregate gate stays strict here.
+    # The split lives in the reported reason and in the backpressure
+    # diagnostic below, which is what ranking configurations needs.
     if _int(record, "actual_xrun_growth", "xrun_growth") != 0:
         return False
     if _max_int(record, "capture_transfer_errors", "playback_transfer_errors", "transfer_errors") != 0:
@@ -203,7 +213,22 @@ def analyze(records, required, parse_diagnostics=None, audit_summaries=None):
         for key, cycle in unique:
             if not any(tuple(r.get(k) for k in CASE_KEYS) == key and r.get("cycle") == cycle and str(r.get("reason", "")).lower() == "lifecycle-after-stop" and _int(r, "lifecycle_after_stop") != 0 for r in records):
                 summary_errors.append("missing lifecycle-after-stop case=%s cycle=%s" % (key, cycle))
+    schemas = {r.get("schema") for r in records if isinstance(r.get("schema"), int)}
+    mixed_aggregate_semantics = (
+        any(v < AGGREGATE_XRUN_REDEFINED_AT_SCHEMA for v in schemas) and
+        any(v >= AGGREGATE_XRUN_REDEFINED_AT_SCHEMA for v in schemas))
     diagnostics = list(parse_diagnostics or []) + summary_errors + list(failures)
+    backpressure = sum(_int(r, "quantum_drop_growth") for r in records
+                       if r.get("quantum_drop_growth") is not None)
+    if backpressure:
+        diagnostics.append(
+            "producer_backpressure quantum_drop_growth=%d: the render block was "
+            "refused at the playback watermark; not a starvation event" % backpressure)
+    if mixed_aggregate_semantics:
+        diagnostics.append(
+            "mixed_aggregate_xrun_semantics schemas=%s: aggregate xruns were "
+            "redefined at schema %d; these runs are not comparable" %
+            (",".join(map(str, sorted(schemas))), AGGREGATE_XRUN_REDEFINED_AT_SCHEMA))
     if lifecycle: diagnostics.append("lifecycle_failures=%d" % lifecycle)
     if transfer: diagnostics.append("transfer_errors=%d" % transfer)
     if xruns: diagnostics.append("xruns=%d" % xruns)

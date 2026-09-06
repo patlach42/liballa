@@ -16,7 +16,7 @@ Audio callbacks and USB completion paths are hard realtime-adjacent code:
 - use bounded lock-free SPSC rings, preallocated ISO storage, eventfd wakeups, and exact rational scheduling;
 - variable-length ISO payloads require cumulative `libusb_get_iso_packet_buffer()` offsets; `_simple` is forbidden unless equal lengths are proven.
 
-Urgent scheduler requests, affinity, ADPF, prefaulting, and optional bounded `mlock` are best effort or setup-time only. Never assume Android grants realtime privileges, IRQ affinity, cpufreq, usbfs sysctls, kernel patches, `mlockall`, or fixed SVE/native CPU tuning.
+Urgent scheduler requests, affinity, ADPF, and prefaulting are best effort or setup-time only. Do not pin the rings: `mlock` was measured against no pinning over six randomised blocks and changed nothing, and on the reference device it never even took effect, because an unaligned 64 KiB ring spans 68 KiB of pages against a 64 KiB `RLIMIT_MEMLOCK` and the call returns `ENOMEM`. `mlockall` remains forbidden. Never assume Android grants realtime privileges, IRQ affinity, cpufreq, usbfs sysctls, kernel patches, `mlockall`, or fixed SVE/native CPU tuning.
 
 ## Device evidence policy
 

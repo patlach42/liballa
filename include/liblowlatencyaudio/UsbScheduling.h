@@ -32,10 +32,40 @@ struct UserspaceBufferConfig {
     int startupPrimeFrames = 0;
     int writeHeadroomFrames = 0;
     int captureLimitFrames = 0;
+    // Capture target is the post-read cushion. Zero selects generic automatic
+    // resolution; positive values are retained exactly when they fit.
+    int captureTargetFrames = 0;
+    int captureHeadroomFrames = 0;
+    int captureDeadlineSlackFrames = 0;
     int transferCount = 0;
     int packetsPerTransfer = 0;
     size_t ringCapacityBytes = 0;
 };
+// Checked frame-budget arithmetic used when resolving a policy against a ring.
+constexpr bool checkedFrameBudgetFits(
+        int first, int second, int third, int capacity) noexcept {
+    if (first < 0 || second < 0 || third < 0 || capacity < 0) return false;
+    const int64_t total = static_cast<int64_t>(first) + second + third;
+    return total <= capacity;
+}
+
+constexpr int checkedFrameSum(int first, int second) noexcept {
+    if (first < 0 || second < 0 ||
+        static_cast<int64_t>(first) + second >
+            std::numeric_limits<int>::max()) {
+        return 0;
+    }
+    return first + second;
+}
+
+// A render quantum is admitted only when every capture frame is present.
+// Processing a partial quantum would expose readInputChannels' zero-filled
+// tail as an audible discontinuity.
+constexpr bool isCompleteCaptureQuantum(
+        int availableFrames, int requiredFrames) noexcept {
+    return requiredFrames > 0 && availableFrames >= requiredFrames;
+}
+
 
 constexpr int kDefaultPeriodMultiplier = 3;
 constexpr int kMinPeriodMultiplier = 1;
@@ -88,6 +118,36 @@ constexpr int playbackWatermarkTransferCount(
         : inflight + reserve;
 }
 
+// Automatic write headroom, derived from how coarsely the ring is drained.
+//
+// Admission requires `writable >= quantum`, that is `occupancy <= target +
+// headroom - quantum`. Between two admissions the consumer normally removes
+// `quantum` frames in `quantum / drainChunk` completions, but the completions
+// are quantised: when only one lands, occupancy climbs by
+// `quantum - drainChunk` in a single step.
+//
+// Measured on an Audient iD4 at 48 kHz with a 64-frame quantum: with four
+// packets per transfer the drain chunk is 24 frames, occupancy before
+// admission ran 81-128 against a threshold of 128, and a cycle that skipped a
+// drain was refused ten frames short. With eight packets the chunk is 48, the
+// same threshold left 91 frames of margin, and no admission was refused.
+// Equating the headroom to the graph quantum ignored the drain granularity,
+// which is what left the narrow geometry with fourteen frames of margin where
+// it needed forty.
+//
+// So the ring must hold the block being admitted plus that worst-case step.
+// A geometry that drains at least a whole quantum per completion keeps the
+// previous behaviour.
+constexpr int automaticWriteHeadroomFrames(int graphQuantum,
+                                           int drainChunkFrames) noexcept {
+    const int quantum = std::max(0, graphQuantum);
+    if (drainChunkFrames <= 0) return quantum;
+    const int step = quantum > drainChunkFrames ? quantum - drainChunkFrames : 0;
+    return quantum > std::numeric_limits<int>::max() - step
+        ? std::numeric_limits<int>::max()
+        : quantum + step;
+}
+
 // Keep the requested number of graph quanta queued before admitting one more.
 inline PlaybackWatermarkConfig playbackWatermarkConfig(
         int requestedFrames, int periodMultiplier = kDefaultPeriodMultiplier) {
@@ -106,6 +166,7 @@ inline int effectivePlaybackTargetFrames(int configured,
 constexpr int resolvedPlaybackTargetFrames(
         int automaticTargetFrames, int manualTargetFrames,
         int graphQuantum, int maxTargetFrames) noexcept {
+    (void)graphQuantum;
     const int maximum = std::max(0, maxTargetFrames);
     if (maximum == 0)
         return 0;
@@ -113,11 +174,8 @@ constexpr int resolvedPlaybackTargetFrames(
         std::min(maximum, std::max(0, automaticTargetFrames));
     if (manualTargetFrames <= 0)
         return automatic;
-    // Calibration may raise the production runway, but a stale cached result
-    // must never undercut a newer automatic safety floor.
-    const int minimum = std::min(
-        maximum, std::max(std::max(0, graphQuantum), automatic));
-    return std::min(maximum, std::max(minimum, manualTargetFrames));
+    // Explicit calibration/expert targets are exact when bounded by capacity.
+    return std::min(maximum, manualTargetFrames);
 }
 constexpr uint64_t playbackRunwayNanoseconds(
         uint64_t queuedFrames, uint32_t sampleRate) noexcept {
@@ -139,14 +197,13 @@ constexpr uint64_t playbackRunwayNanoseconds(
 }
 constexpr int startupPlaybackPrimeFrames(
         int maxTarget, int exactInitialPacketFrames,
-        int playbackTargetFrames, int graphQuantum) noexcept {
+        int playbackTargetFrames) noexcept {
     if (maxTarget <= 0) return 0;
-    const int target = std::max(0, playbackTargetFrames);
-    const int quantum = std::max(0, graphQuantum);
-    const int reserve = target > std::numeric_limits<int>::max() - quantum
-        ? std::numeric_limits<int>::max() : target + quantum;
-    return std::min(maxTarget,
-                    std::max(0, std::max(exactInitialPacketFrames, reserve)));
+    return std::min(
+        maxTarget,
+        std::max(0, std::max(
+            exactInitialPacketFrames,
+            playbackTargetFrames)));
 }
 
 // Exact rational packet scheduler. Each next() returns floor((rate + remainder)/period)
