@@ -107,6 +107,12 @@ struct UsbDriverTestAccess {
     static void playbackStarted(LibusbUacDriver& d, bool started) {
         d.playbackStarted_.store(started, std::memory_order_release);
     }
+    // The credit floor is measured from the intended pipeline depth, so a test
+    // that asserts on the floor has to state the depth rather than inherit the
+    // constructed default.
+    static void playbackTarget(LibusbUacDriver& d, int frames) {
+        d.playbackTargetFrames_.store(frames, std::memory_order_release);
+    }
     static void stopRequested(LibusbUacDriver& d, bool requested) {
         d.stopRequested_.store(requested, std::memory_order_release);
     }
@@ -352,6 +358,10 @@ TEST(UsbDriverRing, WatermarkRejectsPartialFrameAsBackpressureWithoutPlaybackXru
 TEST(UsbDriverRing, PlaybackCreditPacesTheProducerToPlayedFrames) {
     monotrypt::usb::LibusbUacDriver driver;
     monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
+    // Stated, not inherited: the floor is the intended pipeline depth plus the
+    // submitted runway plus the reserve, so a test that does not name the
+    // depth is asserting against a constructor default.
+    monotrypt::usb::UsbDriverTestAccess::playbackTarget(driver, 0);
 
     constexpr int kQuantum = 64;
     // Before playback starts there is nothing to pace against: the initial
@@ -360,7 +370,8 @@ TEST(UsbDriverRing, PlaybackCreditPacesTheProducerToPlayedFrames) {
     EXPECT_EQ(driver.playbackCreditFrames(), 0);
 
     monotrypt::usb::UsbDriverTestAccess::playbackStarted(driver, true);
-    // Nothing has played yet, so nothing may be published.
+    // With no depth, no runway and no reserve the floor is zero: nothing has
+    // played, so nothing may be published.
     EXPECT_FALSE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
 
     // Three transfers of 24 frames grant 72: enough for one quantum, with the
@@ -399,10 +410,31 @@ TEST(UsbDriverRing, PlaybackCreditPacesTheProducerToPlayedFrames) {
     EXPECT_EQ(driver.playbackCreditFrames(), before);
 }
 
+TEST(UsbDriverRing, CreditFloorIsTheIntendedPipelineDepthNotOnlyTheReserve) {
+    monotrypt::usb::LibusbUacDriver driver;
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
+    monotrypt::usb::UsbDriverTestAccess::playbackStarted(driver, true);
+
+    constexpr int kQuantum = 64;
+    // The ledger measures the whole pipeline, not the userspace ring alone. A
+    // producer paced strictly against played frames may still fill the depth
+    // the stream is meant to run at - refusing that is refusing to start - so
+    // the target belongs in the floor with the reserve.
+    monotrypt::usb::UsbDriverTestAccess::playbackTarget(driver, 2 * kQuantum);
+    driver.setPlaybackCreditReserve(0);
+    EXPECT_TRUE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    EXPECT_TRUE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    EXPECT_FALSE(monotrypt::usb::UsbDriverTestAccess::takeCredit(driver, kQuantum));
+    EXPECT_EQ(driver.playbackCreditFrames(), -2 * kQuantum);
+}
+
 TEST(UsbDriverRing, CreditReserveLetsTheProducerHoldABoundedLead) {
     monotrypt::usb::LibusbUacDriver driver;
     monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 2);
     monotrypt::usb::UsbDriverTestAccess::playbackStarted(driver, true);
+    // Isolate the reserve: with no intended depth the floor is the reserve and
+    // nothing else, which is the term this test is about.
+    monotrypt::usb::UsbDriverTestAccess::playbackTarget(driver, 0);
 
     constexpr int kQuantum = 64;
     // Strict credit forbids any lead at all, which is the same as forbidding a
@@ -757,7 +789,13 @@ TEST(UsbDriverUserspaceBuffer, NegativeCaptureTermsAreRejectedBeforeAllocation) 
         monotrypt::usb::LibusbUacDriver driver;
         monotrypt::usb::UserspaceBufferConfig config;
         config.ringCapacityBytes = 4096;
-        config.*field = -1;
+        // Minus one is the explicit-zero sentinel and is a request, not a
+        // mistake: zero already means "derive one", so without it no caller
+        // can ask for none of the term. Anything past the sentinel is still
+        // nonsense and still refused before a byte is allocated.
+        config.*field = monotrypt::usb::kExplicitZeroFrames;
+        EXPECT_TRUE(driver.configureUserspaceBuffers(config));
+        config.*field = monotrypt::usb::kExplicitZeroFrames - 1;
         EXPECT_FALSE(driver.configureUserspaceBuffers(config));
     }
 }

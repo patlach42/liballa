@@ -3225,8 +3225,10 @@ bool LibusbUacDriver::configureUserspaceBuffers(
           config.packetsPerTransfer > kMaxPacketsPerTransfer)) ||
         config.playbackTargetFrames < 0 || config.startupPrimeFrames < 0 ||
         config.writeHeadroomFrames < 0 || config.captureLimitFrames < 0 ||
-        config.captureTargetFrames < 0 || config.captureHeadroomFrames < 0 ||
-        config.captureDeadlineSlackFrames < 0) return false;
+        config.captureTargetFrames < monotrypt::usb::kExplicitZeroFrames ||
+        config.captureHeadroomFrames < monotrypt::usb::kExplicitZeroFrames ||
+        config.captureDeadlineSlackFrames <
+            monotrypt::usb::kExplicitZeroFrames) return false;
     ring_.assign(requestedCapacity, 0);
     captureRing_.assign(requestedCapacity, 0);
     ringMask_ = requestedCapacity - 1;
@@ -3270,12 +3272,12 @@ void LibusbUacDriver::setUserspaceBufferConfig(
             std::numeric_limits<int>::max() / 2
         ? std::numeric_limits<int>::max()
         : captureWave * 2;
-    const int captureTarget = userConfig.captureTargetFrames == 0
-        ? automaticCaptureTarget : userConfig.captureTargetFrames;
-    const int captureHeadroom = userConfig.captureHeadroomFrames == 0
-        ? captureWave : userConfig.captureHeadroomFrames;
-    const int captureSlack = userConfig.captureDeadlineSlackFrames == 0
-        ? captureWave : userConfig.captureDeadlineSlackFrames;
+    const int captureTarget = monotrypt::usb::resolveOptionalFrames(
+        userConfig.captureTargetFrames, automaticCaptureTarget);
+    const int captureHeadroom = monotrypt::usb::resolveOptionalFrames(
+        userConfig.captureHeadroomFrames, captureWave);
+    const int captureSlack = monotrypt::usb::resolveOptionalFrames(
+        userConfig.captureDeadlineSlackFrames, captureWave);
     const bool valid = checkedFrameBudgetFits(
         requestedTarget, headroom, 0, physicalFrames) &&
         prime >= exactInitialPacketFrames_ && prime <= physicalFrames &&

@@ -26,6 +26,16 @@ struct PlaybackWatermarkConfig {
 // automatic policy when its value is zero. Transfer geometry must be selected
 // before the ISO pumps are allocated; the other fields are applied after
 // stream negotiation.
+// Requests exactly none of a term whose zero already means "derive one".
+inline constexpr int kExplicitZeroFrames = -1;
+
+// Resolves one such term: the sentinel means none, zero means the automatic
+// value the caller computed, anything else is the exact request.
+constexpr int resolveOptionalFrames(int requested, int automatic) noexcept {
+    if (requested == kExplicitZeroFrames) return 0;
+    return requested == 0 ? automatic : requested;
+}
+
 struct UserspaceBufferConfig {
     // Zero selects the documented automatic policy. Positive values are exact
     // requests; unsupported values fail startup instead of being raised.
@@ -35,6 +45,11 @@ struct UserspaceBufferConfig {
     int captureLimitFrames = 0;
     // Capture target is the post-read cushion. Zero selects generic automatic
     // resolution; positive values are retained exactly when they fit.
+    //
+    // kExplicitZeroFrames asks for none of it. Zero cannot say that, because
+    // zero already means "derive one", and a sweep that cannot reach a real
+    // zero cannot find where the reserve stops paying for itself: its bottom
+    // arm silently repeats the automatic value.
     int captureTargetFrames = 0;
     int captureHeadroomFrames = 0;
     int captureDeadlineSlackFrames = 0;
