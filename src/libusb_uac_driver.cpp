@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 
@@ -50,6 +51,8 @@ constexpr int kDefaultNumTransfers = 4;
 // Playback backlog is deliberately bounded: target watermark plus one max graph block.
 // 64 KiB covers 2048 frames at the largest supported 8ch/32-bit format.
 constexpr size_t kRingBytes = kPlaybackRingBytes;
+
+
 constexpr size_t kCaptureRingBytes = kPlaybackRingBytes;
 
 
@@ -1209,6 +1212,11 @@ bool LibusbUacDriver::start(int sampleRateHz, int bitsPerSample, int channels,
         }
         captureHead_.store(0, std::memory_order_relaxed);
         captureTail_.store(0, std::memory_order_relaxed);
+        // Session scoped, not envelope scoped: clearing these at the warmup
+        // boundary would re-arm the priming exemption mid-stream and silence a
+        // genuine trim.
+        captureLive_.store(false, std::memory_order_relaxed);
+        startupCaptureDiscardFrames_.store(0, std::memory_order_relaxed);
         captureSequence_.store(0, std::memory_order_relaxed);
         captureOverruns_.store(0, std::memory_order_relaxed);
         metadataFifoOverruns_.store(0, std::memory_order_relaxed);
@@ -1967,7 +1975,16 @@ LibusbUacDriver::prepareCaptureRead(int requestedFrames) noexcept {
         // The consumer owns tail and may discard stale capture while retaining
         // the newest bounded window after a render stall.
         tail = head - limitBytes;
-        captureOverruns_.fetch_add(1, std::memory_order_relaxed);
+        // Only once the stream is live. Capture starts before the graph does -
+        // it has to, because the OUT packet plan is sized from capture
+        // completions - so the first read used to find every frame captured
+        // during graph activation, ring priming and thread start, trim them in
+        // one go, and count an overrun for it. That is timeline alignment, not
+        // the consumer falling behind, and counting it made every session
+        // report a fault it did not have.
+        if (captureLive_.load(std::memory_order_acquire)) {
+            captureOverruns_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     const size_t availableFrames =
@@ -2013,6 +2030,31 @@ int LibusbUacDriver::readCapturePcm(uint8_t* dst, int frames) {
     }
     commitCaptureRead(region);
     return region.frames;
+}
+
+// The handover from priming to live capture, called once by the consumer just
+// before its first read. Keeps the newest window the graph is about to want,
+// drops the pre-roll behind it, and records how much was dropped so the event
+// is classified rather than erased. Runs on the render thread, which is the
+// only owner of the capture tail, so there is no second consumer to race.
+int LibusbUacDriver::beginCaptureLive(int keepFrames) noexcept {
+    if (captureLive_.exchange(true, std::memory_order_acq_rel)) return 0;
+    if (!captureActive_.load(std::memory_order_acquire)) return 0;
+    const int stride = captureFormat_.channels * captureFormat_.bytesPerSample;
+    if (stride <= 0) return 0;
+    const size_t head = captureHead_.load(std::memory_order_acquire);
+    const size_t tail = captureTail_.load(std::memory_order_relaxed);
+    const size_t availableFrames =
+        (head - tail) / static_cast<size_t>(stride);
+    const size_t keep = keepFrames > 0 ? static_cast<size_t>(keepFrames) : 0;
+    if (availableFrames <= keep) return 0;
+    const size_t discarded = availableFrames - keep;
+    captureTail_.store(
+        tail + discarded * static_cast<size_t>(stride),
+        std::memory_order_release);
+    startupCaptureDiscardFrames_.store(static_cast<uint64_t>(discarded),
+                                       std::memory_order_relaxed);
+    return static_cast<int>(discarded);
 }
 
 int LibusbUacDriver::discardCaptureFrames(int maxFrames) noexcept {
@@ -3183,8 +3225,10 @@ bool LibusbUacDriver::configureUserspaceBuffers(
           config.packetsPerTransfer > kMaxPacketsPerTransfer)) ||
         config.playbackTargetFrames < 0 || config.startupPrimeFrames < 0 ||
         config.writeHeadroomFrames < 0 || config.captureLimitFrames < 0 ||
-        config.captureTargetFrames < 0 || config.captureHeadroomFrames < 0 ||
-        config.captureDeadlineSlackFrames < 0) return false;
+        config.captureTargetFrames < monotrypt::usb::kExplicitZeroFrames ||
+        config.captureHeadroomFrames < monotrypt::usb::kExplicitZeroFrames ||
+        config.captureDeadlineSlackFrames <
+            monotrypt::usb::kExplicitZeroFrames) return false;
     ring_.assign(requestedCapacity, 0);
     captureRing_.assign(requestedCapacity, 0);
     ringMask_ = requestedCapacity - 1;
@@ -3193,6 +3237,11 @@ bool LibusbUacDriver::configureUserspaceBuffers(
     ringTail_.store(0, std::memory_order_release);
     captureHead_.store(0, std::memory_order_release);
     captureTail_.store(0, std::memory_order_release);
+    // Session scoped, not envelope scoped: clearing these at the warmup
+    // boundary would re-arm the priming exemption mid-stream and silence a
+    // genuine trim.
+    captureLive_.store(false, std::memory_order_relaxed);
+    startupCaptureDiscardFrames_.store(0, std::memory_order_relaxed);
     userspaceBufferConfig_ = config;
     transferCount_ = config.transferCount != 0 ? config.transferCount : kDefaultNumTransfers;
     return true;
@@ -3211,24 +3260,48 @@ void LibusbUacDriver::setUserspaceBufferConfig(
     const int headroom = userConfig.writeHeadroomFrames == 0
         ? automaticWriteHeadroomFrames(autoConfig.graphQuantum, drainChunkFrames)
         : userConfig.writeHeadroomFrames;
+    // The nominal chunk, not the one the initial packet plan happens to hold.
+    // exactInitialPacketFrames_ is the first, conservative plan and grows to
+    // nominal once implicit feedback has converged: reading it here returned 16
+    // where the stream settles at 24, and the target derived from it was 48 -
+    // the one value this geometry was measured to break at. The negotiated
+    // endpoint decides the nominal chunk and it does not move.
+    // format_ and microframesPerSec_, which start() computed for the playback
+    // endpoint this target belongs to. The capture format is a different
+    // struct and reading it here was simply the wrong one.
+    const int nominalDrainChunkFrames = monotrypt::usb::nominalTransferFrames(
+        format_.sampleRateHz, playbackPacketsPerTransfer_, microframesPerSec_);
     const int requestedTarget = userConfig.playbackTargetFrames == 0
-        ? autoConfig.targetFrames : userConfig.playbackTargetFrames;
+        ? monotrypt::usb::automaticPlaybackTargetFrames(
+              autoConfig.graphQuantum, nominalDrainChunkFrames,
+              autoConfig.targetFrames)
+        : userConfig.playbackTargetFrames;
     const int automaticPrime = startupPlaybackPrimeFrames(
         physicalFrames, exactInitialPacketFrames_, requestedTarget);
     const int prime = userConfig.startupPrimeFrames == 0
         ? automaticPrime : userConfig.startupPrimeFrames;
     const int captureWave = std::max(1, captureTransferFrames_.load(
         std::memory_order_acquire));
-    const int automaticCaptureTarget = captureWave >
-            std::numeric_limits<int>::max() / 2
-        ? std::numeric_limits<int>::max()
-        : captureWave * 2;
-    const int captureTarget = userConfig.captureTargetFrames == 0
-        ? automaticCaptureTarget : userConfig.captureTargetFrames;
-    const int captureHeadroom = userConfig.captureHeadroomFrames == 0
-        ? captureWave : userConfig.captureHeadroomFrames;
-    const int captureSlack = userConfig.captureDeadlineSlackFrames == 0
-        ? captureWave : userConfig.captureDeadlineSlackFrames;
+    // One completion wave, not two. Two was never measured; one was, across a
+    // sweep at the pinned geometry, and it takes about 0.5 ms of round trip out
+    // while leaving every wait timeout soft - the deadline expiring with a whole
+    // quantum still present, which is the reserve being spent as intended
+    // rather than a block being lost. Half a wave breaks: the sweep's next step
+    // down timed out with 29 frames against a 32 frame quantum, missed the
+    // deadline and was heard by the loopback detector.
+    //
+    // One wave is also where the arithmetic stops being lucky. The graph
+    // quantum and the capture chunk share a factor of eight, so a threshold of
+    // quantum plus one wave is crossed with enough in hand that a whole
+    // quantum survives the read; a threshold one chunk lower can be crossed
+    // with less than a quantum left behind.
+    const int automaticCaptureTarget = captureWave;
+    const int captureTarget = monotrypt::usb::resolveOptionalFrames(
+        userConfig.captureTargetFrames, automaticCaptureTarget);
+    const int captureHeadroom = monotrypt::usb::resolveOptionalFrames(
+        userConfig.captureHeadroomFrames, captureWave);
+    const int captureSlack = monotrypt::usb::resolveOptionalFrames(
+        userConfig.captureDeadlineSlackFrames, captureWave);
     const bool valid = checkedFrameBudgetFits(
         requestedTarget, headroom, 0, physicalFrames) &&
         prime >= exactInitialPacketFrames_ && prime <= physicalFrames &&
@@ -3280,17 +3353,27 @@ bool LibusbUacDriver::waitForPlaybackCreditUntil(
     // waiting for the device to consume - which is exactly what paces the
     // producer. A deadline still applies: a device that stops consuming is a
     // transport failure, not a reason to block the render thread forever.
+    // The ledger is written minus played, so in steady state it sits at minus
+    // the whole pipeline: the ring, the frames already handed to USB, and a
+    // held block if there is one. The runway term is the live count. Using
+    // the intended one instead looks safer - a live term is inside the loop
+    // the gate is meant to close - and measured worse: 193 starvation events
+    // and 273 breaks in a cycle that had been clean. Kept as measured. Comparing that against minus the reserve
+    // asked whether the entire pipeline fits inside the reserve, which it
+    // never does - so once the accounting was made honest the gate could not
+    // open at all and every block went through the holding slot. The reserve
+    // is a lead beyond the intended depth, so the depth belongs in the floor.
     const int64_t floor =
-        -static_cast<int64_t>(playbackCreditReserve_.load(std::memory_order_relaxed));
+        -static_cast<int64_t>(playbackTargetFrames_.load(std::memory_order_relaxed)) -
+        static_cast<int64_t>(queuedOutFrames_.load(std::memory_order_relaxed)) -
+        static_cast<int64_t>(playbackCreditReserve_.load(std::memory_order_relaxed));
     const WakeChannel::Registration waiting(playbackWake_);
     while (playbackCredit_.load(std::memory_order_acquire) - frames < floor &&
            streaming_.load(std::memory_order_acquire) &&
            !transportFailed_.load(std::memory_order_acquire)) {
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - std::chrono::steady_clock::now()).count();
+        const int remaining = monotrypt::usb::pollMillisUntil(deadline);
         if (remaining <= 0) break;
-        if (!playbackWake_.poll(static_cast<int>(remaining))) break;
+        if (!playbackWake_.poll(remaining)) break;
     }
     return playbackCredit_.load(std::memory_order_acquire) - frames >= floor;
 }
@@ -3325,11 +3408,9 @@ bool LibusbUacDriver::waitForWritableFramesUntil(
     while (writableToTargetFrames() < frames &&
            streaming_.load(std::memory_order_acquire) &&
            !transportFailed_.load(std::memory_order_acquire)) {
-        const auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - std::chrono::steady_clock::now()).count();
+        const int remaining = monotrypt::usb::pollMillisUntil(deadline);
         if (remaining <= 0) break;
-        if (!playbackWake_.poll(static_cast<int>(remaining))) break;
+        if (!playbackWake_.poll(remaining)) break;
     }
     // Falls back to the ceiling on expiry: the producer prefers to sit at the
     // target, but when the deadline is gone publishing into the headroom beats

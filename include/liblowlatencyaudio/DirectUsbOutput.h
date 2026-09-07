@@ -364,6 +364,9 @@ public:
     bool takePlaybackCredit(int frames) noexcept {
         return driver_.takePlaybackCredit(frames);
     }
+    void chargePlaybackCredit(int frames) noexcept {
+        driver_.chargePlaybackCredit(frames);
+    }
     void injectServiceStallUs(int microseconds) noexcept {
         driver_.injectServiceStallUs(microseconds);
     }
@@ -388,6 +391,12 @@ public:
     }
     int discardCaptureFrames(int frames) noexcept {
         return driver_.discardCaptureFrames(frames);
+    }
+    int beginCaptureLive(int keepFrames) noexcept {
+        return driver_.beginCaptureLive(keepFrames);
+    }
+    uint64_t startupCaptureDiscardFrames() const noexcept {
+        return driver_.startupCaptureDiscardFrames();
     }
 
     uint64_t xrunCount() const noexcept {

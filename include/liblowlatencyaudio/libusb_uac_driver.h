@@ -206,6 +206,10 @@ public:
         playbackUnderruns_.store(0, std::memory_order_relaxed);
     }
     int discardCaptureFrames(int maxFrames) noexcept;
+    int beginCaptureLive(int keepFrames) noexcept;
+    uint64_t startupCaptureDiscardFrames() const noexcept {
+        return startupCaptureDiscardFrames_.load(std::memory_order_relaxed);
+    }
     uint64_t capturePacketDropCount() const noexcept {
         return capturePacketDrops_.load(std::memory_order_acquire);
     }
@@ -456,11 +460,32 @@ public:
     int playbackCreditReserve() const noexcept {
         return playbackCreditReserve_.load(std::memory_order_relaxed);
     }
+    // An unconditional debit, for audio that is going out whether or not the
+    // ledger has room for it. The reserve is an admission rule - how far the
+    // producer may run ahead before it is made to wait - and it has no business
+    // deciding whether a block that has already been accepted gets recorded.
+    // Refusing the charge instead of taking it let a block enter the holding
+    // slot unpaid and be republished free, and each one of those granted a
+    // whole quantum of lead that nothing ever took back.
+    void chargePlaybackCredit(int frames) noexcept {
+        if (frames <= 0) return;
+        if (!playbackStarted_.load(std::memory_order_acquire)) return;
+        playbackCredit_.fetch_sub(static_cast<int64_t>(frames),
+                                  std::memory_order_acq_rel);
+    }
+
     bool takePlaybackCredit(int frames) noexcept {
         if (frames <= 0) return true;
         if (!playbackStarted_.load(std::memory_order_acquire)) return true;
+        // Same floor as the wait: the ledger measures the whole pipeline, so
+        // the intended depth belongs in the comparison and the reserve is the
+        // lead permitted beyond it.
         const int64_t floor =
-            -static_cast<int64_t>(playbackCreditReserve_.load(
+            -static_cast<int64_t>(playbackTargetFrames_.load(
+                std::memory_order_relaxed)) -
+            static_cast<int64_t>(queuedOutFrames_.load(
+                std::memory_order_relaxed)) -
+            static_cast<int64_t>(playbackCreditReserve_.load(
                 std::memory_order_relaxed));
         int64_t credit = playbackCredit_.load(std::memory_order_relaxed);
         while (credit - frames >= floor) {
@@ -755,6 +780,10 @@ private:
     // Completions collected by one event-loop wakeup, and the worst such count.
     std::atomic<uint32_t> callbacksThisPoll_{0};
     std::atomic<uint32_t> maxCallbacksPerPoll_{0};
+    // Capture runs before the graph does, so its first frames belong to a
+    // priming epoch rather than to the stream the graph will render.
+    std::atomic<bool> captureLive_{false};
+    std::atomic<uint64_t> startupCaptureDiscardFrames_{0};
     // The longest event-loop iteration that ended up collecting more than one
     // completion, and how much of it the thread spent waiting for a CPU.
     std::atomic<uint64_t> worstMultiCollectSpanNs_{0};

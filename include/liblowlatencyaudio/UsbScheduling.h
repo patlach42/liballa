@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <limits>
 
@@ -25,6 +26,16 @@ struct PlaybackWatermarkConfig {
 // automatic policy when its value is zero. Transfer geometry must be selected
 // before the ISO pumps are allocated; the other fields are applied after
 // stream negotiation.
+// Requests exactly none of a term whose zero already means "derive one".
+inline constexpr int kExplicitZeroFrames = -1;
+
+// Resolves one such term: the sentinel means none, zero means the automatic
+// value the caller computed, anything else is the exact request.
+constexpr int resolveOptionalFrames(int requested, int automatic) noexcept {
+    if (requested == kExplicitZeroFrames) return 0;
+    return requested == 0 ? automatic : requested;
+}
+
 struct UserspaceBufferConfig {
     // Zero selects the documented automatic policy. Positive values are exact
     // requests; unsupported values fail startup instead of being raised.
@@ -34,6 +45,11 @@ struct UserspaceBufferConfig {
     int captureLimitFrames = 0;
     // Capture target is the post-read cushion. Zero selects generic automatic
     // resolution; positive values are retained exactly when they fit.
+    //
+    // kExplicitZeroFrames asks for none of it. Zero cannot say that, because
+    // zero already means "derive one", and a sweep that cannot reach a real
+    // zero cannot find where the reserve stops paying for itself: its bottom
+    // arm silently repeats the automatic value.
     int captureTargetFrames = 0;
     int captureHeadroomFrames = 0;
     int captureDeadlineSlackFrames = 0;
@@ -70,6 +86,26 @@ constexpr bool isCompleteCaptureQuantum(
 constexpr int kDefaultPeriodMultiplier = 3;
 constexpr int kMinPeriodMultiplier = 1;
 constexpr int kMaxPeriodMultiplier = 8;
+// Milliseconds to poll for until a deadline, rounded up. A deadline shorter
+// than a millisecond used to round to zero and skip the wait entirely: the
+// admission deadline is one quantum period, which at 32 frames is 0.667 ms, so
+// below a 64 frame quantum the target gate never waited and every block went
+// straight to the ceiling test - which is why the ring's operating point did
+// not respond to the target, the headroom or the credit reserve. The poll
+// takes milliseconds, so overshoot is bounded by one of them.
+inline int pollMillisUntil(std::chrono::steady_clock::time_point deadline,
+                           std::chrono::steady_clock::time_point now) noexcept {
+    const auto remainingNs =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
+    if (remainingNs <= 0) return 0;
+    const long long ms = (remainingNs + 999999) / 1000000;
+    return static_cast<int>(ms > 0 ? ms : 1);
+}
+
+inline int pollMillisUntil(std::chrono::steady_clock::time_point deadline) noexcept {
+    return pollMillisUntil(deadline, std::chrono::steady_clock::now());
+}
+
 constexpr int kMinPacketsPerTransfer = 1;
 constexpr int kMaxPacketsPerTransfer = 8;
 
@@ -158,6 +194,27 @@ inline PlaybackWatermarkConfig playbackWatermarkConfig(
     const int target = std::min(kMaxGraphQuantum, quantum * multiplier);
     return {quantum, target, quantum + target};
 }
+// The automatic playback target, once the negotiated geometry is known.
+//
+// The period rule above sizes the target as whole graph quanta, which is what a
+// caller can compute before a device has been opened. It holds more than the
+// pipeline needs. What the target actually has to cover is one quantum of render
+// lateness plus one drain chunk of USB granularity, because a chunk is the unit
+// the ring empties in: measured at quantum 32 with a 24 frame chunk, 56 frames
+// ran eight cycles with nothing on any fault counter, against 2.67-3.15 ms and a
+// discontinuity cluster for the 64 the period rule gives. 48 is past the edge -
+// the OUT runway reached zero in half its cycles and an xrun followed each time.
+//
+// Falls back to the period rule when the chunk is not known yet, which is every
+// caller that has not negotiated a device. A larger chunk asks for more cover,
+// not less, which is the direction that keeps a bigger transfer safe.
+constexpr int automaticPlaybackTargetFrames(
+        int quantum, int drainChunkFrames, int periodTargetFrames) noexcept {
+    if (quantum <= 0 || drainChunkFrames <= 0) return periodTargetFrames;
+    if (quantum > kMaxGraphQuantum - drainChunkFrames) return kMaxGraphQuantum;
+    return quantum + drainChunkFrames;
+}
+
 inline int effectivePlaybackTargetFrames(int configured,
                                          int queuedTransferFrames) noexcept {
     return std::max(0, std::max(configured, queuedTransferFrames));
