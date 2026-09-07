@@ -194,6 +194,27 @@ inline PlaybackWatermarkConfig playbackWatermarkConfig(
     const int target = std::min(kMaxGraphQuantum, quantum * multiplier);
     return {quantum, target, quantum + target};
 }
+// The automatic playback target, once the negotiated geometry is known.
+//
+// The period rule above sizes the target as whole graph quanta, which is what a
+// caller can compute before a device has been opened. It holds more than the
+// pipeline needs. What the target actually has to cover is one quantum of render
+// lateness plus one drain chunk of USB granularity, because a chunk is the unit
+// the ring empties in: measured at quantum 32 with a 24 frame chunk, 56 frames
+// ran eight cycles with nothing on any fault counter, against 2.67-3.15 ms and a
+// discontinuity cluster for the 64 the period rule gives. 48 is past the edge -
+// the OUT runway reached zero in half its cycles and an xrun followed each time.
+//
+// Falls back to the period rule when the chunk is not known yet, which is every
+// caller that has not negotiated a device. A larger chunk asks for more cover,
+// not less, which is the direction that keeps a bigger transfer safe.
+constexpr int automaticPlaybackTargetFrames(
+        int quantum, int drainChunkFrames, int periodTargetFrames) noexcept {
+    if (quantum <= 0 || drainChunkFrames <= 0) return periodTargetFrames;
+    if (quantum > kMaxGraphQuantum - drainChunkFrames) return kMaxGraphQuantum;
+    return quantum + drainChunkFrames;
+}
+
 inline int effectivePlaybackTargetFrames(int configured,
                                          int queuedTransferFrames) noexcept {
     return std::max(0, std::max(configured, queuedTransferFrames));

@@ -3260,8 +3260,22 @@ void LibusbUacDriver::setUserspaceBufferConfig(
     const int headroom = userConfig.writeHeadroomFrames == 0
         ? automaticWriteHeadroomFrames(autoConfig.graphQuantum, drainChunkFrames)
         : userConfig.writeHeadroomFrames;
+    // The nominal chunk, not the one the initial packet plan happens to hold.
+    // exactInitialPacketFrames_ is the first, conservative plan and grows to
+    // nominal once implicit feedback has converged: reading it here returned 16
+    // where the stream settles at 24, and the target derived from it was 48 -
+    // the one value this geometry was measured to break at. The negotiated
+    // endpoint decides the nominal chunk and it does not move.
+    // format_ and microframesPerSec_, which start() computed for the playback
+    // endpoint this target belongs to. The capture format is a different
+    // struct and reading it here was simply the wrong one.
+    const int nominalDrainChunkFrames = monotrypt::usb::nominalTransferFrames(
+        format_.sampleRateHz, playbackPacketsPerTransfer_, microframesPerSec_);
     const int requestedTarget = userConfig.playbackTargetFrames == 0
-        ? autoConfig.targetFrames : userConfig.playbackTargetFrames;
+        ? monotrypt::usb::automaticPlaybackTargetFrames(
+              autoConfig.graphQuantum, nominalDrainChunkFrames,
+              autoConfig.targetFrames)
+        : userConfig.playbackTargetFrames;
     const int automaticPrime = startupPlaybackPrimeFrames(
         physicalFrames, exactInitialPacketFrames_, requestedTarget);
     const int prime = userConfig.startupPrimeFrames == 0

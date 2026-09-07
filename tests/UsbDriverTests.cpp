@@ -113,6 +113,15 @@ struct UsbDriverTestAccess {
     static void playbackTarget(LibusbUacDriver& d, int frames) {
         d.playbackTargetFrames_.store(frames, std::memory_order_release);
     }
+    // The three the automatic playback target is derived from, so a test can
+    // pin the geometry the device would have negotiated.
+    static void playbackPacketGeometry(
+            LibusbUacDriver& d, int sampleRateHz, int packetsPerTransfer,
+            int microframesPerSec) {
+        d.format_.sampleRateHz = sampleRateHz;
+        d.playbackPacketsPerTransfer_ = packetsPerTransfer;
+        d.microframesPerSec_ = microframesPerSec;
+    }
     static void stopRequested(LibusbUacDriver& d, bool requested) {
         d.stopRequested_.store(requested, std::memory_order_release);
     }
@@ -1809,4 +1818,25 @@ TEST(UsbDriverLine6, ProfileReportsFixedCaptureChannels) {
     monotrypt::usb::UsbDriverTestAccess::fakeDevice(driver);
     monotrypt::usb::UsbDriverTestAccess::line6Profile(driver, true);
     EXPECT_EQ(driver.captureChannelCount(), 2);
+}
+TEST(UsbDriverUserspaceBuffer, AutomaticPlaybackTargetIsQuantumPlusNominalChunk) {
+    monotrypt::usb::LibusbUacDriver driver;
+    monotrypt::usb::UsbDriverTestAccess::playbackFormat(driver, 2, 4);
+    monotrypt::usb::UsbDriverTestAccess::captureFormat(driver, 2, 4);
+    // The measured geometry: 48 kHz, four packets a transfer, high speed with
+    // bInterval one. That is a 24 frame chunk, and the target should be 56.
+    monotrypt::usb::UsbDriverTestAccess::playbackPacketGeometry(
+        driver, 48000, 4, 8000);
+
+    monotrypt::usb::UserspaceBufferConfig config;
+    config.ringCapacityBytes = 65536;
+    ASSERT_TRUE(driver.configureUserspaceBuffers(config));
+    monotrypt::usb::UsbDriverTestAccess::playbackPacketGeometry(
+        driver, 48000, 4, 8000);
+    driver.setUserspaceBufferConfig(32, config, 2);
+
+    // Not 64. The period rule gave 64 and held more than the pipeline needs;
+    // this is the quantum plus one nominal drain chunk, and it is the number
+    // eight measured cycles ran clean at.
+    EXPECT_EQ(driver.playbackTargetFrames(), 56);
 }

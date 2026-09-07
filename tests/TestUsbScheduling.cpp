@@ -657,3 +657,30 @@ TEST(PollMillisUntilTest, ReportsNothingLeftOnAPassedDeadline) {
     EXPECT_EQ(0, monotrypt::usb::pollMillisUntil(now, now));
     EXPECT_EQ(0, monotrypt::usb::pollMillisUntil(now - milliseconds(1), now));
 }
+
+TEST(UsbScheduling, AutomaticPlaybackTargetCoversAQuantumAndADrainChunk) {
+    // The measured geometry: quantum 32, chunk 24. The period rule gives 64;
+    // what the pipeline needs is 56, and 56 is what ran eight cycles clean.
+    EXPECT_EQ(
+        monotrypt::usb::automaticPlaybackTargetFrames(32, 24, 64), 56);
+
+    // A bigger chunk asks for more cover, not less. That is the direction that
+    // keeps a bigger transfer safe rather than the direction that saves frames.
+    EXPECT_EQ(
+        monotrypt::usb::automaticPlaybackTargetFrames(32, 48, 64), 80);
+
+    // Before a device has been negotiated there is no chunk, and the period
+    // rule is the only thing a caller can compute. Falling back to it keeps
+    // every pre-negotiation caller on the behaviour it already had.
+    EXPECT_EQ(
+        monotrypt::usb::automaticPlaybackTargetFrames(32, 0, 64), 64);
+    EXPECT_EQ(
+        monotrypt::usb::automaticPlaybackTargetFrames(0, 24, 64), 64);
+
+    // Saturates rather than overflowing past the largest quantum the graph
+    // will run.
+    EXPECT_EQ(
+        monotrypt::usb::automaticPlaybackTargetFrames(
+            monotrypt::usb::kMaxGraphQuantum, 24, 64),
+        monotrypt::usb::kMaxGraphQuantum);
+}
